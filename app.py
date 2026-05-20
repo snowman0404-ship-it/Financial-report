@@ -44,8 +44,16 @@ PL_TAGS = {
         "SalesAndRevenuesNet", "RevenuesNetOfInterestExpense",
     ],
     "OperatingExpenses": [
-        "CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsSold",
-        "OperatingExpenses", "CostsAndExpenses",
+        "CostOfRevenue",
+        "CostOfGoodsAndServicesSold",
+        "CostOfGoodsSold",
+        "OperatingExpenses",
+        "CostsAndExpenses",
+        "OperatingCostsAndExpenses",
+        "CostAndExpenses",
+        "CostOfRevenueExcludingDepreciation",
+        "OperatingExpensesExcludingDepreciation",
+        "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
     ],
     "OperatingIncomeLoss": [
         "OperatingIncomeLoss",
@@ -96,12 +104,18 @@ BS_TAGS = {
         "DebtAndCapitalLeaseObligations",
     ],
     "NonCurrentAssets": [
-        "AssetsNoncurrent",
         "PropertyPlantAndEquipmentNet",
+        "AssetsNoncurrent",
         "PropertyPlantAndEquipmentAndIntangibleAssetsNet",
         "PropertyPlantAndEquipmentNetIncludingDiscontinuedOperations",
         "NoncurrentAssets",
         "PropertyPlantAndEquipmentGross",
+        "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+        "RightOfUseAsset",
+    ],
+    "TotalAssets": [
+        "Assets",
+        "AssetsNet",
     ],
     "StockholdersEquity": [
         "StockholdersEquity",
@@ -352,17 +366,33 @@ def extract_pl(facts: dict, target_period: str | None = None) -> dict:
         quarterly = _dedup_latest(_filter_quarterly(recs), 30)
         current = prior = None
         if quarterly:
-            cur_rec = _find_closest(quarterly, target, 45) if target else quarterly[0]
+            cur_rec = _find_closest(quarterly, target, 55) if target else quarterly[0]
             if cur_rec is None:
                 cur_rec = quarterly[0]
             current = (cur_rec.get("val"), cur_rec["end"], tag)
             cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
             prior_target = cur_end - timedelta(days=365)
             others = [r for r in quarterly if r["end"] != cur_rec["end"]]
-            prior_rec = _find_closest(others, prior_target, 46)
+            prior_rec = _find_closest(others, prior_target, 55)
             if prior_rec:
                 prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
+
+    # Derive OperatingExpenses = Revenues - OperatingIncomeLoss (if not found)
+    if result.get("OperatingExpenses", {}).get("current") is None:
+        rev = result.get("Revenues", {})
+        opi = result.get("OperatingIncomeLoss", {})
+        if rev.get("current") and opi.get("current"):
+            r_val, r_end, _ = rev["current"]
+            o_val, o_end, _ = opi["current"]
+            if r_end == o_end and r_val is not None and o_val is not None:
+                result["OperatingExpenses"]["current"] = (r_val - o_val, r_end, "※導出値: Revenues − OperatingIncomeLoss")
+        if rev.get("prior") and opi.get("prior"):
+            r_val, r_end, _ = rev["prior"]
+            o_val, o_end, _ = opi["prior"]
+            if r_end == o_end and r_val is not None and o_val is not None:
+                result["OperatingExpenses"]["prior"] = (r_val - o_val, r_end, "※導出値: Revenues − OperatingIncomeLoss")
+
     return result
 
 
@@ -374,17 +404,35 @@ def extract_bs(facts: dict, target_period: str | None = None) -> dict:
         instants = _dedup_latest(_filter_instant(recs), 8)
         current = prior = None
         if instants:
-            cur_rec = _find_closest(instants, target, 45) if target else instants[0]
+            cur_rec = _find_closest(instants, target, 55) if target else instants[0]
             if cur_rec is None:
                 cur_rec = instants[0]
             current = (cur_rec.get("val"), cur_rec["end"], tag)
             cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
             prior_target = cur_end - timedelta(days=92)
             others = [r for r in instants if r["end"] != cur_rec["end"]]
-            prior_rec = _find_closest(others, prior_target, 46)
+            prior_rec = _find_closest(others, prior_target, 55)
             if prior_rec:
                 prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
+
+    # Derive NonCurrentAssets = TotalAssets - CurrentAssets (if not found)
+    if result.get("NonCurrentAssets", {}).get("current") is None:
+        tot = result.get("TotalAssets", {})
+        ca  = result.get("CurrentAssets", {})
+        if tot.get("current") and ca.get("current"):
+            t_val, t_end, _ = tot["current"]
+            c_val, c_end, _ = ca["current"]
+            if t_end == c_end and t_val is not None and c_val is not None:
+                result["NonCurrentAssets"]["current"] = (t_val - c_val, t_end, "※導出値: TotalAssets − CurrentAssets")
+        if tot.get("prior") and ca.get("prior"):
+            t_val, t_end, _ = tot["prior"]
+            c_val, c_end, _ = ca["prior"]
+            if t_end == c_end and t_val is not None and c_val is not None:
+                result["NonCurrentAssets"]["prior"] = (t_val - c_val, t_end, "※導出値: TotalAssets − CurrentAssets")
+
+    # Remove TotalAssets from result (it's a helper, not displayed)
+    result.pop("TotalAssets", None)
     return result
 
 # ─────────────────────────────────────────────────────────────────────────────
