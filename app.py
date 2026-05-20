@@ -413,16 +413,17 @@ def extract_pl(facts: dict, target_period: str | None = None) -> dict:
         quarterly = _dedup_latest(quarterly, 30)
         current = prior = None
         if quarterly:
-            cur_rec = _find_closest(quarterly, target, 55) if target else quarterly[0]
-            if cur_rec is None:
-                cur_rec = quarterly[0]
-            current = (cur_rec.get("val"), cur_rec["end"], tag)
-            cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
-            prior_target = cur_end - timedelta(days=365)
-            others = [r for r in quarterly if r["end"] != cur_rec["end"]]
-            prior_rec = _find_closest(others, prior_target, 55)
-            if prior_rec:
-                prior = (prior_rec.get("val"), prior_rec["end"], tag)
+            cur_rec = _find_closest(quarterly, target, 65) if target else quarterly[0]
+            # Do NOT fall back to quarterly[0] when a target is specified —
+            # returning data for the wrong period is worse than returning None.
+            if cur_rec is not None:
+                current = (cur_rec.get("val"), cur_rec["end"], tag)
+                cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+                prior_target = cur_end - timedelta(days=365)
+                others = [r for r in quarterly if r["end"] != cur_rec["end"]]
+                prior_rec = _find_closest(others, prior_target, 65)
+                if prior_rec:
+                    prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
     # Derive OperatingExpenses = Revenues − OperatingIncomeLoss per period independently.
@@ -447,19 +448,20 @@ def extract_bs(facts: dict, target_period: str | None = None) -> dict:
     result = {}
     for metric, candidates in BS_TAGS.items():
         tag, recs = _best_tag(facts, candidates)
-        instants = _dedup_latest(_filter_instant(recs), 8)
+        instants = _dedup_latest(_filter_instant(recs), 12)
         current = prior = None
         if instants:
-            cur_rec = _find_closest(instants, target, 55) if target else instants[0]
-            if cur_rec is None:
+            cur_rec = _find_closest(instants, target, 65) if target else instants[0]
+            if cur_rec is None and not target:
                 cur_rec = instants[0]
-            current = (cur_rec.get("val"), cur_rec["end"], tag)
-            cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
-            prior_target = cur_end - timedelta(days=92)
-            others = [r for r in instants if r["end"] != cur_rec["end"]]
-            prior_rec = _find_closest(others, prior_target, 55)
-            if prior_rec:
-                prior = (prior_rec.get("val"), prior_rec["end"], tag)
+            if cur_rec is not None:
+                current = (cur_rec.get("val"), cur_rec["end"], tag)
+                cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+                prior_target = cur_end - timedelta(days=92)
+                others = [r for r in instants if r["end"] != cur_rec["end"]]
+                prior_rec = _find_closest(others, prior_target, 65)
+                if prior_rec:
+                    prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
     # Always derive LongTermLiabilities = TotalLiabilities - CurrentLiabilities
@@ -588,45 +590,65 @@ def build_pl_df(pl: dict) -> pd.DataFrame:
 
 
 def build_bs_df(bs: dict) -> pd.DataFrame:
-    # ① Canonical dates
     canon_cur = _canon_date(bs, "current")
     canon_pri = _canon_date(bs, "prior")
     cur_col   = f"当四半期末 ({canon_cur})\n[USD M]"
     pri_col   = f"前四半期末 ({canon_pri})\n[USD M]"
 
-    rows = []
-    for key, label in BS_LABELS.items():
-        data = bs.get(key, {})
-        cur  = _safe_val(data, "current") if _period_ok(data, "current", canon_cur) else None
-        pri  = _safe_val(data, "prior")   if _period_ok(data, "prior",   canon_pri) else None
-        tag  = data["current"][2]         if data.get("current") else "—"
+    def _bv(k, w):
+        data = bs.get(k, {})
+        return _safe_val(data, w) if _period_ok(data, w, canon_cur if w == "current" else canon_pri) else None
 
-        delta   = (cur - pri) if (cur is not None and pri is not None) else None
-        pct     = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
-        is_liab = key in ("CurrentLiabilities", "LongTermLiabilities")
-        rows.append({
-            "項目 / Metric": label,
-            cur_col:         cur,
-            pri_col:         pri,
-            "差額 [USD M]":  delta,
-            "変化率 %":       _pct_label(pct, cur, pri, is_liab),
-            "_pct": pct, "_is_cost": is_liab, "_cur": cur, "_pri": pri, "_tag": tag,
-        })
-    # ③ Other Current Assets (derived)
-    def _bv(k, w): return _safe_val(bs.get(k, {}), w) if _period_ok(bs.get(k, {}), w, canon_cur if w == "current" else canon_pri) else None
-    ca  = _bv("CurrentAssets", "current"); ca_p  = _bv("CurrentAssets", "prior")
-    cash= _bv("Cash", "current");          cashp = _bv("Cash", "prior")
-    oca = (ca - cash)   if (ca   is not None and cash  is not None) else None
-    ocap= (ca_p - cashp)if (ca_p is not None and cashp is not None) else None
-    oca_d  = (oca - ocap) if (oca is not None and ocap is not None) else None
-    oca_pct= oca_d / abs(ocap) if (oca_d is not None and ocap not in (None, 0)) else None
-    rows.append({
-        "項目 / Metric": "その他流動資産 / Other Current Assets (=CurrentAssets−Cash)",
-        cur_col: oca, pri_col: ocap,
-        "差額 [USD M]": oca_d,
-        "変化率 %":      _pct_label(oca_pct, oca, ocap, False),
-        "_pct": oca_pct, "_is_cost": False, "_cur": oca, "_pri": ocap, "_tag": "(計算値)",
-    })
+    def _item(key, label, is_liab):
+        data   = bs.get(key, {})
+        cur    = _bv(key, "current"); pri = _bv(key, "prior")
+        tag    = data["current"][2] if data.get("current") else "—"
+        delta  = (cur - pri) if (cur is not None and pri is not None) else None
+        pct    = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
+        return {"項目 / Metric": label, cur_col: cur, pri_col: pri,
+                "差額 [USD M]": delta, "変化率 %": _pct_label(pct, cur, pri, is_liab),
+                "_pct": pct, "_is_cost": is_liab, "_cur": cur, "_pri": pri,
+                "_tag": tag, "_is_subtotal": False}
+
+    def _subtotal(label, vals_c, vals_p):
+        cur = sum(v for v in vals_c if v is not None) if any(v is not None for v in vals_c) else None
+        pri = sum(v for v in vals_p if v is not None) if any(v is not None for v in vals_p) else None
+        delta = (cur - pri) if (cur is not None and pri is not None) else None
+        return {"項目 / Metric": label, cur_col: cur, pri_col: pri,
+                "差額 [USD M]": delta, "変化率 %": "",
+                "_pct": None, "_is_cost": False, "_cur": cur, "_pri": pri,
+                "_tag": "(合計)", "_is_subtotal": True}
+
+    cash_c = _bv("Cash", "current");          cash_p = _bv("Cash", "prior")
+    ca_c   = _bv("CurrentAssets", "current"); ca_p   = _bv("CurrentAssets", "prior")
+    oca_c  = (ca_c - cash_c) if (ca_c is not None and cash_c is not None) else None
+    oca_p  = (ca_p - cash_p) if (ca_p is not None and cash_p is not None) else None
+    nca_c  = _bv("NonCurrentAssets", "current"); nca_p = _bv("NonCurrentAssets", "prior")
+    cl_c   = _bv("CurrentLiabilities", "current"); cl_p = _bv("CurrentLiabilities", "prior")
+    ltl_c  = _bv("LongTermLiabilities", "current"); ltl_p = _bv("LongTermLiabilities", "prior")
+    eq_c   = _bv("StockholdersEquity", "current"); eq_p  = _bv("StockholdersEquity", "prior")
+
+    oca_d   = (oca_c - oca_p) if (oca_c is not None and oca_p is not None) else None
+    oca_pct = oca_d / abs(oca_p) if (oca_d is not None and oca_p not in (None, 0)) else None
+
+    rows = [
+        # ── 資産の部 ──────────────────────────────────
+        _item("Cash", "手元資金 / Cash & Equivalents", False),
+        {"項目 / Metric": "その他流動資産 / Other Current Assets",
+         cur_col: oca_c, pri_col: oca_p, "差額 [USD M]": oca_d,
+         "変化率 %": _pct_label(oca_pct, oca_c, oca_p, False),
+         "_pct": oca_pct, "_is_cost": False, "_cur": oca_c, "_pri": oca_p,
+         "_tag": "(計算値)", "_is_subtotal": False},
+        _item("NonCurrentAssets", "固定資産 / Non-Current Assets", False),
+        _subtotal("▶ 資産合計 / Total Assets",
+                  [cash_c, oca_c, nca_c], [cash_p, oca_p, nca_p]),
+        # ── 負債・資本の部 ──────────────────────────────
+        _item("CurrentLiabilities", "流動負債 / Current Liabilities", True),
+        _item("LongTermLiabilities", "長期負債 / LT Liabilities", True),
+        _item("StockholdersEquity", "株主資本 / Stockholders' Equity", False),
+        _subtotal("▶ 負債・資本合計 / Total L+E",
+                  [cl_c, ltl_c, eq_c], [cl_p, ltl_p, eq_p]),
+    ]
     return pd.DataFrame(rows)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,6 +666,10 @@ def _style_df(df: pd.DataFrame):
 
     def highlight_row(row):
         idx     = row.name
+        is_sub  = df.iloc[idx].get("_is_subtotal", False)
+        if is_sub:
+            return pd.Series(["background-color: #BDD7EE; font-weight: bold;"] * len(display_cols),
+                             index=display_cols)
         pct     = df.iloc[idx]["_pct"]
         is_cost = df.iloc[idx]["_is_cost"]
         cur     = df.iloc[idx].get("_cur")
@@ -651,9 +677,9 @@ def _style_df(df: pd.DataFrame):
         if pct is None or (isinstance(pct, float) and pd.isna(pct)):
             bg = ""
         elif not is_cost and cur is not None and pri is not None and pri > 0 and cur < 0:
-            bg = "background-color: #FFD2D2;"   # 赤字転落
+            bg = "background-color: #FFD2D2;"
         elif not is_cost and cur is not None and pri is not None and pri < 0 and cur > 0:
-            bg = ""                              # 黒字転換はハイライトなし
+            bg = ""
         else:
             bad = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
             bg  = "background-color: #FFD2D2;" if bad else ""
@@ -729,97 +755,6 @@ def risk_verdict(r: dict) -> tuple[str, str, str]:
     return "✅ 現時点で重大なリスクシグナルなし\nNo major risk signals detected.", "#D2FFD2", "🟢"
 
 
-def compute_alerts(pl: dict, bs: dict) -> list[dict]:
-    """6条件の複合アラート（PL×3 + BS×3）を返す。"""
-    def _v(data, key, which):
-        t = data.get(key, {}).get(which)
-        return _m(t[0]) if (t is not None and t[0] is not None) else None
-
-    def _pct(cur, pri):
-        if cur is None or pri is None:
-            return None
-        try:
-            if abs(float(pri)) < 1e-9:
-                return None
-            return (float(cur) - float(pri)) / abs(float(pri))
-        except (TypeError, ValueError):
-            return None
-
-    def _fp(pct, cur, pri):
-        if pct is None:
-            return "N/A"
-        if cur is not None and pri is not None:
-            if pri < 0 and cur >= 0:
-                return "黒字転換"
-            if pri >= 0 and cur < 0:
-                return "赤字転落"
-        return f"{pct:+.1%}"
-
-    rev_c  = _v(pl, "Revenues",            "current"); rev_p  = _v(pl, "Revenues",            "prior")
-    opex_c = _v(pl, "OperatingExpenses",   "current"); opex_p = _v(pl, "OperatingExpenses",   "prior")
-    opi_c  = _v(pl, "OperatingIncomeLoss", "current"); opi_p  = _v(pl, "OperatingIncomeLoss", "prior")
-    ibt_c  = _v(pl, "IncomeLossBeforeTax", "current"); ibt_p  = _v(pl, "IncomeLossBeforeTax", "prior")
-    cash_c = _v(bs, "Cash",               "current");  cash_p = _v(bs, "Cash",               "prior")
-    cl_c   = _v(bs, "CurrentLiabilities", "current");  cl_p   = _v(bs, "CurrentLiabilities", "prior")
-    ca_c   = _v(bs, "CurrentAssets",      "current");  ca_p   = _v(bs, "CurrentAssets",      "prior")
-    eq_c   = _v(bs, "StockholdersEquity", "current");  eq_p   = _v(bs, "StockholdersEquity", "prior")
-
-    oca_c = (ca_c - cash_c) if (ca_c is not None and cash_c is not None) else None
-    oca_p = (ca_p - cash_p) if (ca_p is not None and cash_p is not None) else None
-
-    rev_chg  = _pct(rev_c,  rev_p);  opex_chg = _pct(opex_c, opex_p)
-    opi_chg  = _pct(opi_c,  opi_p);  ibt_chg  = _pct(ibt_c,  ibt_p)
-    cash_chg = _pct(cash_c, cash_p); cl_chg   = _pct(cl_c,   cl_p)
-    oca_chg  = _pct(oca_c,  oca_p);  eq_chg   = _pct(eq_c,   eq_p)
-
-    alerts = []
-
-    # PL-1: 収益性悪化
-    if rev_chg is not None and opex_chg is not None and rev_chg < opex_chg:
-        alerts.append({"code": "PL-1", "type": "PL", "title": "収益性悪化",
-                        "reason": f"売上高変化率 {_fp(rev_chg, rev_c, rev_p)} < 営業費用変化率 {_fp(opex_chg, opex_c, opex_p)}"})
-
-    # PL-2: コストコントロール不全
-    if rev_chg is not None and rev_chg >= 0 and opi_chg is not None and opi_chg < 0:
-        alerts.append({"code": "PL-2", "type": "PL", "title": "コストコントロール不全",
-                        "reason": f"増収（売上 {_fp(rev_chg, rev_c, rev_p)}）にもかかわらず営業利益 {_fp(opi_chg, opi_c, opi_p)}"})
-
-    # PL-3: 金融・本業外リスク
-    if opi_c is not None and opi_c > 0 and ibt_c is not None:
-        if ibt_c < 0:
-            alerts.append({"code": "PL-3", "type": "PL", "title": "金融・本業外リスク",
-                            "reason": f"営業利益 +{opi_c:,.1f}M なのに税引前利益がマイナス（{ibt_c:,.1f}M）"})
-        elif ibt_chg is not None and ibt_chg <= -0.20:
-            alerts.append({"code": "PL-3", "type": "PL", "title": "金融・本業外リスク",
-                            "reason": f"営業利益プラスなのに税引前利益が大幅減少（{_fp(ibt_chg, ibt_c, ibt_p)}）"})
-
-    # BS-1: 資金繰りショート懸念
-    if cash_chg is not None and cash_chg <= -0.20 and cl_chg is not None and cl_chg >= 0.10:
-        alerts.append({"code": "BS-1", "type": "BS", "title": "資金繰りショート懸念",
-                        "reason": f"手元資金 {_fp(cash_chg, cash_c, cash_p)} かつ 流動負債 {_fp(cl_chg, cl_c, cl_p)}"})
-
-    # BS-2: 在庫・売掛金の滞留リスク
-    if cash_chg is not None and cash_chg < 0 and oca_chg is not None and oca_chg >= 0.20:
-        alerts.append({"code": "BS-2", "type": "BS", "title": "在庫・売掛金の滞留リスク",
-                        "reason": f"手元資金 {_fp(cash_chg, cash_c, cash_p)} かつ その他流動資産 {_fp(oca_chg, oca_c, oca_p)}"})
-
-    # BS-3: 自己資本の減少
-    if eq_chg is not None and eq_chg < 0:
-        alerts.append({"code": "BS-3", "type": "BS", "title": "自己資本の減少",
-                        "reason": f"株主資本変化率 {_fp(eq_chg, eq_c, eq_p)}"})
-
-    return alerts
-
-
-_ALERT_DEFS = [
-    ("PL-1", "収益性悪化",             "売上高より営業費用の伸び率が高い"),
-    ("PL-2", "コストコントロール不全",    "売上増にもかかわらず営業利益が低下"),
-    ("PL-3", "金融・本業外リスク",        "本業黒字でも税前利益がマイナスまたは大幅悪化"),
-    ("BS-1", "資金繰りショート懸念",      "現金QoQ −20%以上 かつ 流動負債QoQ +10%以上"),
-    ("BS-2", "在庫・売掛金の滞留リスク",  "現金減少局面でその他流動資産が急増"),
-    ("BS-3", "自己資本の減少",            "株主資本がQoQでマイナス"),
-]
-
 _KPI_NOTES_MD = """
 | 指標 | 見方・チェック理由 |
 |------|------------------|
@@ -829,50 +764,6 @@ _KPI_NOTES_MD = """
 | **流動負債 QoQ** | 目の前に迫る支払いの増減。現金が減っている局面でここが激増＝短期資金繰りの**デッドクロス**リスク。 |
 | **株主資本 QoQ** | 基礎体力の増減。マイナスは本業赤字 or 身の丈に合わない配当・自社株買いで会社が細っているサイン。 |
 """
-
-
-def _show_composite_alerts(alerts: list[dict]) -> None:
-    """Streamlit UIに複合アラートをレンダリングする（全6条件の判定表 + KPI解説）。"""
-    triggered = {a["code"]: a["reason"] for a in alerts}
-    n = len(alerts)
-
-    st.markdown("### 🚨 複合アラート判定（PL×3 / BS×3）")
-
-    # Summary banner
-    if n == 0:
-        st.success("✅ アラートなし — 6条件すべてで重大な財務悪化シグナルは検出されませんでした。")
-    else:
-        st.error(f"⚠️ {n}件のアラートを検出 — 詳細は下表の判定理由を確認してください。")
-
-    # Full 6-condition table
-    rows_html = ""
-    for code, title, _cond in _ALERT_DEFS:
-        is_bad  = code in triggered
-        status  = "⚠️ アラート" if is_bad else "✅ 正常"
-        reason  = triggered.get(code, "—条件非該当—")
-        bg      = "#FFD2D2" if is_bad else "#D2FFD2"
-        rows_html += (
-            f'<tr style="background:{bg};">'
-            f'<td style="padding:4px 8px;font-weight:bold;">{status}</td>'
-            f'<td style="padding:4px 8px;font-weight:bold;">{code}</td>'
-            f'<td style="padding:4px 8px;">{title}</td>'
-            f'<td style="padding:4px 8px;color:#444;">{reason}</td>'
-            f'</tr>'
-        )
-    st.markdown(
-        f'<table style="width:100%;border-collapse:collapse;font-size:.92rem;">'
-        f'<thead><tr style="background:#1F4E79;color:#fff;">'
-        f'<th style="padding:6px 8px;">判定</th>'
-        f'<th style="padding:6px 8px;">コード</th>'
-        f'<th style="padding:6px 8px;">アラート名</th>'
-        f'<th style="padding:6px 8px;">判定理由</th>'
-        f'</tr></thead><tbody>{rows_html}</tbody></table>',
-        unsafe_allow_html=True,
-    )
-
-    # KPI explanation expander
-    with st.expander("📖 各指標の見方・チェック理由", expanded=False):
-        st.markdown(_KPI_NOTES_MD)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Excel Builder (3 tabs)
@@ -1146,54 +1037,7 @@ def _build_dashboard_sheet(wb, company_name, ticker, cik, pl, bs, bs_rows_map):
         _ratio_row("自己資本比率 / Equity Ratio",
                    er_v, er_p, FMT_PCT, _er_status(er_v), er_fill)
 
-    dr += 1
-    wd.merge_cells(f"A{dr}:G{dr}")
-    c = wd.cell(row=dr, column=1, value="🚨  複合アラート判定（PL×3 / BS×3）")
-    c.fill = PatternFill("solid", fgColor="C00000")
-    c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=12)
-    c.alignment = _L; wd.row_dimensions[dr].height = 26; dr += 1
-    _hrow(wd, dr, ["", "コード", "アラート名", "判定理由", "状態", "", ""]); wd.row_dimensions[dr].height = 20; dr += 1
-
-    composite_alerts = compute_alerts(pl, bs)
-    all_codes = ["PL-1", "PL-2", "PL-3", "BS-1", "BS-2", "BS-3"]
-    all_titles = {
-        "PL-1": "収益性悪化",           "PL-2": "コストコントロール不全",
-        "PL-3": "金融・本業外リスク",   "BS-1": "資金繰りショート懸念",
-        "BS-2": "在庫・売掛金の滞留リスク", "BS-3": "自己資本の減少",
-    }
-    triggered = {a["code"]: a["reason"] for a in composite_alerts}
-    for code in all_codes:
-        is_bad = code in triggered
-        wd.cell(row=dr, column=1).border = _BORDER
-        _sc(wd.cell(row=dr, column=2, value=code), font=Font(name="Calibri", bold=True, size=10), align=_C)
-        _sc(wd.cell(row=dr, column=3, value=all_titles[code]), font=_NORM, align=_L)
-        reason_cell = wd.cell(row=dr, column=4, value=triggered.get(code, "—条件非該当—"))
-        _sc(reason_cell, font=_NORM, align=_L)
-        sc = wd.cell(row=dr, column=5, value="⚠️ アラート" if is_bad else "✅ 正常")
-        _sc(sc, fill=(_RED_F if is_bad else _GRN_F), align=_C)
-        if is_bad:
-            for col in [2, 3, 4]:
-                wd.cell(row=dr, column=col).fill = PatternFill("solid", fgColor="FFD2D2")
-        for col in [6, 7]: wd.cell(row=dr, column=col).border = _BORDER
-        wd.row_dimensions[dr].height = 18; dr += 1
-
-    dr += 1
-    wd.merge_cells(f"A{dr}:G{dr}")
-    n_alerts = len(composite_alerts)
-    if n_alerts == 0:
-        overall_txt = "✅ アラートなし — 6条件すべてで重大な財務悪化シグナルは検出されませんでした"
-        overall_fill = PatternFill("solid", fgColor="D2FFD2")
-        overall_font = Font(name="Calibri", bold=True, size=12, color="1E6B2E")
-    else:
-        overall_txt = f"⚠️ {n_alerts}件のアラートを検出 — 詳細は上記の判定理由を確認してください"
-        overall_fill = PatternFill("solid", fgColor="FFD2D2")
-        overall_font = Font(name="Calibri", bold=True, size=12, color="C00000")
-    vc = wd.cell(row=dr, column=1, value=overall_txt)
-    vc.fill = overall_fill; vc.font = overall_font
-    vc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    wd.row_dimensions[dr].height = 30; dr += 2
-
-    dr += 1
+    dr += 2
     wd.merge_cells(f"A{dr}:G{dr}")
     rk = wd.cell(row=dr, column=1, value="📉  主要BS項目 QoQ変化チェック")
     rk.fill = PatternFill("solid", fgColor="385723")
@@ -1443,7 +1287,8 @@ if demo_btn:
     k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
     k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
     k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
-    _show_composite_alerts(compute_alerts(pl, bs))
+    with st.expander("📖 各指標の見方・チェック理由", expanded=False):
+        st.markdown(_KPI_NOTES_MD)
     st.markdown("---")
 
     st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
@@ -1451,7 +1296,7 @@ if demo_btn:
     st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
     st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-    st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=280)
+    st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=340)
 
     st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
     st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
@@ -1523,7 +1368,8 @@ elif st.session_state.get("filings"):
         k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
         k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
         k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
-        _show_composite_alerts(compute_alerts(pl, bs))
+        with st.expander("📖 各指標の見方・チェック理由", expanded=False):
+            st.markdown(_KPI_NOTES_MD)
         st.markdown("---")
 
         st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
@@ -1531,7 +1377,7 @@ elif st.session_state.get("filings"):
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-        st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=280)
+        st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=340)
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
