@@ -1474,10 +1474,10 @@ elif st.session_state.get("filings"):
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
         _bs_df = build_bs_df(bs)
-    st.dataframe(_style_df(_bs_df), width="stretch", height=340)
-    _bs_note = _bs_imbalance_note(_bs_df)
-    if _bs_note:
-        st.caption(_bs_note)
+        st.dataframe(_style_df(_bs_df), width="stretch", height=340)
+        _bs_note = _bs_imbalance_note(_bs_df)
+        if _bs_note:
+            st.caption(_bs_note)
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
