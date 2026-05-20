@@ -261,84 +261,110 @@ def _strip_html(html: str) -> str:
         return re.sub(r"<[^>]+>", " ", html)
 
 
+
+def _find_toc_end(text: str) -> int:
+    """Estimate where the Table of Contents ends.
+    TOC entries look like: "Item N. Some Title.........32"
+    Returns char position after the last detected TOC entry
+    (searched only within first 40% of the document).
+    """
+    toc_pat = re.compile(r'(?i)\bITEM\s+\d+[A-Za-z]?[^\n]{0,120}\s+\d{1,3}\s*\n')
+    limit = int(len(text) * 0.40)
+    last_pos = 0
+    for m in toc_pat.finditer(text, 0, limit):
+        last_pos = m.end()
+    return last_pos
+
+
 def extract_mda(html: str, form_type: str = "10-Q", max_chars: int = 30_000) -> str:
     """Extract MD&A prose from a SEC filing HTML.
 
-    10-K : Item 7  ...  Item 7A / Item 8
-    10-Q : Item 2  ...  Item 3
-    Tables are stripped before extraction.
-    When TOC and body both match, the match with the most content before
-    the end marker is selected (body always wins over a brief TOC entry).
+    10-K: Item 7 → Item 8  (Item 7Aコンテンツも含む)
+    10-Q: Item 2 → Item 3
+
+    Strategy:
+    1. Strip all HTML tables (removes financial tables + most TOC tables).
+    2. For 10-K: detect TOC end position, then search for Item 7 only in
+       the document body (post-TOC region).
+    3. Extract to the next end-marker (Item 8 for 10-K, Item 3 for 10-Q).
+    4. Fallback: if TOC detection misses, search full text with best-match.
     """
-    # ── Strip all HTML tables (removes TOC tables + financial tables) ──────
+    # ── Strip tables ────────────────────────────────────────────────────────
     html = re.sub(r'<table[\s>].*?</table>', ' ', html,
                   flags=re.IGNORECASE | re.DOTALL)
     text = _strip_html(html)
     text = re.sub(r'[ \t]{2,}', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
 
-    # Apostrophe / right-single-quote variants used in SEC filings
-    _AP = "[\u2019\u2018'\u0060]"
-
     if form_type == "10-K":
-        # 10-K: MD&A is Item 7, ends at Item 7A or Item 8
-        full_title = (r'(?i)ITEM[\s.]*7[.\s]+'
-                      r'MANAGEMENT' + "[\u2019\u2018'\u0060]?" + r'S[\s]+'
-                      r'DISCUSSION[\s]+AND[\s]+ANALYSIS[\s]+OF[\s]+'
-                      r'FINANCIAL[\s]+CONDITION[\s]+AND[\s]+RESULTS[\s]+OF[\s]+OPERATIONS')
+        # Full section title (most specific → avoids TOC shorthand)
+        full_title = (
+            r'(?i)ITEM[\s.]*7[.\s]+'
+            "MANAGEMENT[\u2019\u2018'\u0060]?S[\s]+"
+            r'DISCUSSION[\s]+AND[\s]+ANALYSIS[\s]+OF[\s]+'
+            r'FINANCIAL[\s]+CONDITION[\s]+AND[\s]+RESULTS[\s]+OF[\s]+OPERATIONS'
+        )
         short_title = r'(?i)ITEM[\s.]*7[.\s]+MANAGEMENT'
         bare        = r'(?i)\bITEM\s*7\b'
-        start_pats = [full_title, short_title, bare]
+        start_pats  = [full_title, short_title, bare]
+        # Stop at Item 8 only (include Item 7A in the extract)
         end_pats = [
-            r'(?i)\bITEM\s*7A[.\s]',
-            r'(?i)\bITEM\s*7A\b',
             r'(?i)\bITEM\s*8[.\s]',
             r'(?i)\bITEM\s*8\b',
         ]
     else:
-        # 10-Q: MD&A is Item 2, ends at Item 3
-        full_title = (r'(?i)ITEM[\s.]*2[.\s]+'
-                      r'MANAGEMENT' + "[\u2019\u2018'\u0060]?" + r'S[\s]+'
-                      r'DISCUSSION[\s]+AND[\s]+ANALYSIS[\s]+OF[\s]+'
-                      r'FINANCIAL[\s]+CONDITION[\s]+AND[\s]+RESULTS[\s]+OF[\s]+OPERATIONS')
+        full_title = (
+            r'(?i)ITEM[\s.]*2[.\s]+'
+            "MANAGEMENT[\u2019\u2018'\u0060]?S[\s]+"
+            r'DISCUSSION[\s]+AND[\s]+ANALYSIS[\s]+OF[\s]+'
+            r'FINANCIAL[\s]+CONDITION[\s]+AND[\s]+RESULTS[\s]+OF[\s]+OPERATIONS'
+        )
         short_title = r'(?i)ITEM[\s.]*2[.\s]+MANAGEMENT'
         bare        = r'(?i)\bITEM\s*2\b'
-        start_pats = [full_title, short_title, bare]
+        start_pats  = [full_title, short_title, bare]
         end_pats = [
             r'(?i)\bITEM\s*3[.\s]',
             r'(?i)\bITEM\s*3\b',
             r'(?i)\bITEM\s*4\b',
         ]
 
-    # ── Find best start: pick the match with the most content to the end ──
-    best_start = -1
-    best_content_len = 0
-    for pat in start_pats:
-        matched_any = False
-        for m in re.finditer(pat, text):
-            matched_any = True
-            pos = m.start()
-            after_header = pos + len(m.group())
-            probe = text[after_header: after_header + 120_000]
-            end_off = len(probe)
-            for ep in end_pats:
-                em = re.search(ep, probe)
-                if em:
-                    end_off = min(end_off, em.start())
-            if end_off > best_content_len:
-                best_content_len = end_off
-                best_start = pos
-        if matched_any:
-            break   # use first pattern level that has any match
+    # ── Primary: search only in the post-TOC body region ─────────────────
+    body_offset = _find_toc_end(text) if form_type == "10-K" else 0
+    search_text = text[body_offset:]
 
-    if best_start == -1:
+    section_start = -1
+    for pat in start_pats:
+        m = re.search(pat, search_text)
+        if m:
+            section_start = body_offset + m.start()
+            break
+
+    # ── Fallback: best-match across full text ────────────────────────────
+    if section_start == -1:
+        best_start, best_len = -1, 0
+        for pat in start_pats:
+            matched = False
+            for m in re.finditer(pat, text):
+                matched = True
+                pos = m.start(); hl = len(m.group())
+                probe = text[pos + hl: pos + hl + 120_000]
+                eoff = len(probe)
+                for ep in end_pats:
+                    em = re.search(ep, probe)
+                    if em: eoff = min(eoff, em.start())
+                if eoff > best_len:
+                    best_len, best_start = eoff, pos
+            if matched: break
+        section_start = best_start
+
+    if section_start == -1:
         return text[:max_chars].strip()
 
-    # ── Cut from best_start to the nearest end marker ────────────────────
-    tail = text[best_start:]
+    # ── Cut from section_start to the end marker ────────────────────────
+    tail = text[section_start:]
     end_offset = len(tail)
     for pat in end_pats:
-        m = re.search(pat, tail[80:])   # skip past the section header
+        m = re.search(pat, tail[80:])   # skip past the section header itself
         if m:
             end_offset = min(end_offset, m.start() + 80)
 
