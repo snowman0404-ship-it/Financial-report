@@ -201,54 +201,6 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
     return {"pe": pe, "pe_label": pe_label, "pb": pb}
 
 
-def compute_altman_z(bs: dict, pl: dict):
-    """Compute Altman Z-Score from EDGAR XBRL data.
-    Uses Z' model (book value) since market cap may be unavailable.
-    Z' = 0.717*X1 + 0.847*X2 + 3.107*X3 + 0.420*X4 + 0.998*X5
-    """
-    def _cv(k):
-        v = bs.get(k, {}).get("current")
-        return float(v[0]) / 1e6 if v and v[0] is not None else None
-
-    ca  = _cv("CurrentAssets")
-    cl  = _cv("CurrentLiabilities")
-    nca = _cv("NonCurrentAssets")
-    eq  = _cv("StockholdersEquity")
-    ltl = _cv("LongTermLiabilities")
-
-    if None in (ca, cl, nca, eq, ltl):
-        return None
-
-    ta  = (ca or 0) + (nca or 0)
-    tl  = (cl or 0) + (ltl or 0)
-    wc  = (ca or 0) - (cl or 0)
-
-    rev_d = pl.get("Revenues", {}).get("current")
-    op_d  = pl.get("OperatingIncomeLoss", {}).get("current")
-    rev = float(rev_d[0]) / 1e6 if rev_d and rev_d[0] is not None else None
-    op  = float(op_d[0]) / 1e6  if op_d and op_d[0] is not None else None
-
-    if ta == 0 or tl == 0 or None in (rev, op):
-        return None
-
-    x1 = wc / ta
-    x2 = (eq or 0) / ta   # approximation: RE ≈ Equity
-    x3 = op / ta
-    x4 = (eq or 0) / tl   # book equity / total liabilities
-    x5 = rev / ta
-
-    z = 0.717*x1 + 0.847*x2 + 3.107*x3 + 0.420*x4 + 0.998*x5
-
-    if z > 2.99:
-        zone, color, emoji = "安全圏 / Safe Zone", "#D2FFD2", "🟢"
-    elif z > 1.81:
-        zone, color, emoji = "グレーゾーン / Grey Zone", "#FFFACD", "🟡"
-    else:
-        zone, color, emoji = "危険圏 / Distress Zone", "#FFD2D2", "🔴"
-
-    return {"z": z, "zone": zone, "color": color, "emoji": emoji,
-            "x1": x1, "x2": x2, "x3": x3, "x4": x4, "x5": x5}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Tag Maps
@@ -1910,7 +1862,6 @@ if st.session_state.get("filings"):
         with col_val:
             st.markdown("### 💹 バリュエーション指標")
             val_info = _compute_valuation(ticker, facts, bs)
-            z_data   = compute_altman_z(bs, pl)
 
             pe       = val_info.get("pe")
             pe_label = val_info.get("pe_label", "PER（株価収益率）")
@@ -1919,36 +1870,13 @@ if st.session_state.get("filings"):
             st.metric(pe_label, f"{pe:.1f}倍" if pe else "N/A")
             st.metric("PBR（株価純資産倍率）", f"{pb:.1f}倍" if pb else "N/A")
 
-            # Altman Z
-            if z_data:
-                st.metric("アルトマンZスコア", f"{z_data['z']:.1f}", delta=z_data["zone"])
-            else:
-                st.metric("アルトマンZスコア", "N/A")
-
-            # Explanation expander
             with st.expander("📖 各指標の見方", expanded=False):
                 st.markdown("""
 | 指標 | 見方 |
 |------|------|
-| **PER（実績）** | 株価÷EPS（直近12ヶ月）。**15〜20倍**が標準。30倍超は割高警戒。赤字時はN/A→予想PERで代替表示。 |
+| **PER（実績）** | 株価÷EPS（直近12ヶ月TTM）。**15〜20倍**が標準。30倍超は割高警戒。赤字時はN/A→予想PERで代替表示。 |
 | **PER（予想）** | 株価÷来期予想EPS。赤字期など実績PERが取得できない場合に自動切替。 |
 | **PBR** | 株価÷1株純資産。**1倍割れ**は理論上割安。エネルギーは1〜2倍が標準。 |
-| **Zスコア** | 倒産確率モデル（Altman Z'）。**2.99超**=安全圏、**1.81〜2.99**=グレーゾーン、**1.81未満**=危険圏。 |
-
----
-**アルトマン Z' スコア 計算式**（非上場・簿価モデル / Altman 1995）
-
-$$Z' = 0.717 \\times X_1 + 0.847 \\times X_2 + 3.107 \\times X_3 + 0.420 \\times X_4 + 0.998 \\times X_5$$
-
-| 変数 | 計算式 | 意味 |
-|------|--------|------|
-| X₁ | 運転資本 ÷ 総資産 | 短期流動性 |
-| X₂ | 株主資本 ÷ 総資産 | 累積収益性（留保利益の近似） |
-| X₃ | 営業利益 ÷ 総資産 | 資産収益性（EBIT） |
-| X₄ | 株主資本（簿価）÷ 総負債 | 財務レバレッジ |
-| X₅ | 売上高 ÷ 総資産 | 資産回転率 |
-
-※ X₂は本来「留保利益÷総資産」ですが、EDGAR XBRLから直接取得できないため株主資本で近似しています。
 """)
 
 else:
