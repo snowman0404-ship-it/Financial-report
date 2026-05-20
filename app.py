@@ -378,20 +378,24 @@ def extract_pl(facts: dict, target_period: str | None = None) -> dict:
                 prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
-    # Derive OperatingExpenses = Revenues - OperatingIncomeLoss (if not found)
-    if result.get("OperatingExpenses", {}).get("current") is None:
+    # Derive OperatingExpenses = Revenues - OperatingIncomeLoss (if not found or val is None)
+    def _val_is_missing(d, key):
+        t = d.get(key, {}).get("current")
+        return t is None or t[0] is None
+
+    if _val_is_missing(result, "OperatingExpenses"):
         rev = result.get("Revenues", {})
         opi = result.get("OperatingIncomeLoss", {})
-        if rev.get("current") and opi.get("current"):
-            r_val, r_end, _ = rev["current"]
-            o_val, o_end, _ = opi["current"]
-            if r_end == o_end and r_val is not None and o_val is not None:
-                result["OperatingExpenses"]["current"] = (r_val - o_val, r_end, "※導出値: Revenues − OperatingIncomeLoss")
-        if rev.get("prior") and opi.get("prior"):
-            r_val, r_end, _ = rev["prior"]
-            o_val, o_end, _ = opi["prior"]
-            if r_end == o_end and r_val is not None and o_val is not None:
-                result["OperatingExpenses"]["prior"] = (r_val - o_val, r_end, "※導出値: Revenues − OperatingIncomeLoss")
+        for which in ("current", "prior"):
+            r_t = rev.get(which)
+            o_t = opi.get(which)
+            if r_t and o_t:
+                r_val, r_end, _ = r_t
+                o_val, o_end, _ = o_t
+                if r_val is not None and o_val is not None:
+                    if not result.get("OperatingExpenses"):
+                        result["OperatingExpenses"] = {}
+                    result["OperatingExpenses"][which] = (r_val - o_val, r_end, "※導出値: Revenues − OperatingIncomeLoss")
 
     return result
 
@@ -416,20 +420,24 @@ def extract_bs(facts: dict, target_period: str | None = None) -> dict:
                 prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
-    # Derive NonCurrentAssets = TotalAssets - CurrentAssets (if not found)
-    if result.get("NonCurrentAssets", {}).get("current") is None:
+    # Derive NonCurrentAssets = TotalAssets - CurrentAssets (if not found or val is None)
+    def _bs_val_missing(d, key):
+        t = d.get(key, {}).get("current")
+        return t is None or t[0] is None
+
+    if _bs_val_missing(result, "NonCurrentAssets"):
         tot = result.get("TotalAssets", {})
         ca  = result.get("CurrentAssets", {})
-        if tot.get("current") and ca.get("current"):
-            t_val, t_end, _ = tot["current"]
-            c_val, c_end, _ = ca["current"]
-            if t_end == c_end and t_val is not None and c_val is not None:
-                result["NonCurrentAssets"]["current"] = (t_val - c_val, t_end, "※導出値: TotalAssets − CurrentAssets")
-        if tot.get("prior") and ca.get("prior"):
-            t_val, t_end, _ = tot["prior"]
-            c_val, c_end, _ = ca["prior"]
-            if t_end == c_end and t_val is not None and c_val is not None:
-                result["NonCurrentAssets"]["prior"] = (t_val - c_val, t_end, "※導出値: TotalAssets − CurrentAssets")
+        for which in ("current", "prior"):
+            t_t = tot.get(which)
+            c_t = ca.get(which)
+            if t_t and c_t:
+                t_val, t_end, _ = t_t
+                c_val, c_end, _ = c_t
+                if t_val is not None and c_val is not None:
+                    if not result.get("NonCurrentAssets"):
+                        result["NonCurrentAssets"] = {}
+                    result["NonCurrentAssets"][which] = (t_val - c_val, t_end, "※導出値: TotalAssets − CurrentAssets")
 
     # Remove TotalAssets from result (it's a helper, not displayed)
     result.pop("TotalAssets", None)
