@@ -58,10 +58,28 @@ def _get_yf_info(ticker: str) -> dict:
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info
+        # PE: trailing preferred; fall back to forward when trailing unavailable (e.g. loss year)
+        trailing_pe = info.get("trailingPE")
+        forward_pe  = info.get("forwardPE")
+        if trailing_pe and trailing_pe > 0:
+            pe, pe_label = trailing_pe, "PER（実績）"
+        elif forward_pe and forward_pe > 0:
+            pe, pe_label = forward_pe, "PER（予想）"
+        else:
+            pe, pe_label = None, "PER"
+        # PBR: priceToBook preferred; compute from marketCap/bookValue if missing
+        pb = info.get("priceToBook")
+        if not pb:
+            mc = info.get("marketCap")
+            bv = info.get("bookValue")    # per-share book value
+            sh = info.get("sharesOutstanding")
+            if mc and bv and sh and bv > 0:
+                pb = mc / (bv * sh)
         return {
             "price":      info.get("currentPrice") or info.get("regularMarketPrice"),
-            "pe":         info.get("trailingPE"),
-            "pb":         info.get("priceToBook"),
+            "pe":         pe,
+            "pe_label":   pe_label,
+            "pb":         pb,
             "market_cap": info.get("marketCap"),
             "shares":     info.get("sharesOutstanding"),
         }
@@ -1750,8 +1768,9 @@ if st.session_state.get("filings"):
             z_data = compute_altman_z(bs, pl)
 
             # PER
-            pe = yf_info.get("pe")
-            st.metric("PER（株価収益率）", f"{pe:.1f}倍" if pe else "N/A")
+            pe       = yf_info.get("pe")
+            pe_label = yf_info.get("pe_label", "PER（株価収益率）")
+            st.metric(pe_label, f"{pe:.1f}倍" if pe else "N/A")
 
             # PBR
             pb = yf_info.get("pb")
@@ -1768,9 +1787,25 @@ if st.session_state.get("filings"):
                 st.markdown("""
 | 指標 | 見方 |
 |------|------|
-| **PER** | 株価÷EPS。**15〜20倍**が標準。30倍超は割高警戒。赤字時はN/A。 |
+| **PER（実績）** | 株価÷EPS（直近12ヶ月）。**15〜20倍**が標準。30倍超は割高警戒。赤字時はN/A→予想PERで代替表示。 |
+| **PER（予想）** | 株価÷来期予想EPS。赤字期など実績PERが取得できない場合に自動切替。 |
 | **PBR** | 株価÷1株純資産。**1倍割れ**は理論上割安。エネルギーは1〜2倍が標準。 |
-| **Zスコア** | 倒産確率モデル。**2.99超**=安全圏、**1.81〜2.99**=グレーゾーン、**1.81未満**=危険圏。 |
+| **Zスコア** | 倒産確率モデル（Altman Z'）。**2.99超**=安全圏、**1.81〜2.99**=グレーゾーン、**1.81未満**=危険圏。 |
+
+---
+**アルトマン Z' スコア 計算式**（非上場・簿価モデル / Altman 1995）
+
+$$Z' = 0.717 \\times X_1 + 0.847 \\times X_2 + 3.107 \\times X_3 + 0.420 \\times X_4 + 0.998 \\times X_5$$
+
+| 変数 | 計算式 | 意味 |
+|------|--------|------|
+| X₁ | 運転資本 ÷ 総資産 | 短期流動性 |
+| X₂ | 株主資本 ÷ 総資産 | 累積収益性（留保利益の近似） |
+| X₃ | 営業利益 ÷ 総資産 | 資産収益性（EBIT） |
+| X₄ | 株主資本（簿価）÷ 総負債 | 財務レバレッジ |
+| X₅ | 売上高 ÷ 総資産 | 資産回転率 |
+
+※ X₂は本来「留保利益÷総資産」ですが、EDGAR XBRLから直接取得できないため株主資本で近似しています。
 """)
 
 else:
