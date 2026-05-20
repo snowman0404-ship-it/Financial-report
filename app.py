@@ -198,7 +198,8 @@ def get_filings_list(cik: str) -> list[dict]:
         data = r.json()
     except Exception:
         return []
-    recent = data.get("filings", {}).get("recent", {})
+    fy_end  = data.get("fiscalYearEnd", "1231")   # e.g. "1231" or "0331"
+    recent  = data.get("filings", {}).get("recent", {})
     forms      = recent.get("form", [])
     dates      = recent.get("filingDate", [])
     periods    = recent.get("reportDate", [])
@@ -214,6 +215,7 @@ def get_filings_list(cik: str) -> list[dict]:
                 "period": period,
                 "accession": acc,
                 "primary_doc": doc,
+                "fy_end": fy_end,
                 "label": f"{form} — {period}（提出日: {date}）",
             })
     return result[:24]
@@ -333,7 +335,16 @@ def _best_tag(facts: dict, candidates: list) -> tuple[str, list]:
     return "", []
 
 
-def _filter_quarterly(records: list, lo: int = 75, hi: int = 110) -> list:
+# Duration ranges per fiscal quarter: (strict_lo, strict_hi, relaxed_lo, relaxed_hi) in days
+_QUARTER_RANGES = {
+    1: (75,  110, 60,  125),   # Q1  ~3 months
+    2: (165, 195, 150, 210),   # Q2  ~6 months YTD
+    3: (255, 285, 240, 300),   # Q3  ~9 months YTD
+    4: (340, 400, 325, 415),   # Q4/10-K  ~12 months
+}
+
+
+def _filter_duration(records: list, lo: int, hi: int) -> list:
     out = []
     for r in records:
         s, e = r.get("start", ""), r.get("end", "")
@@ -347,64 +358,39 @@ def _filter_quarterly(records: list, lo: int = 75, hi: int = 110) -> list:
     return out
 
 
-def _filter_annual(records: list) -> list:
-    """Filter for full-year duration records (340-400 days)."""
-    out = []
-    for r in records:
-        s, e = r.get("start", ""), r.get("end", "")
-        if s and e:
-            try:
-                d = (datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(s, "%Y-%m-%d")).days
-                if 340 <= d <= 400:
-                    out.append(r)
-            except ValueError:
-                pass
-    return out
+def _quarter_num(period_str: str, fy_end_mmdd: str) -> int:
+    """Compute fiscal quarter (1–4) from period end date and FY-end MMDD string (e.g. '1231')."""
+    try:
+        p_month = datetime.strptime(period_str, "%Y-%m-%d").month
+        fy_month = int(fy_end_mmdd[:2])
+        fy_start_month = (fy_month % 12) + 1
+        months_in = (p_month - fy_start_month) % 12 + 1
+        return min(4, (months_in + 2) // 3)
+    except Exception:
+        return 1
 
 
-def _best_quarterly_tag(facts: dict, candidates: list) -> tuple[str, list, list]:
-    """Return (tag, all_recs, quarterly_recs) for the first candidate that has quarterly data.
-
-    Strategy:
-    1. Scan every candidate; pick the first whose records contain at least one
-       quarter-length duration (75-110 days, then relaxed 60-125 days as fallback).
-    2. If nothing qualifies, return the first candidate with any records so the
-       caller can still attempt the derivation fallback.
-    """
+def _best_ytd_tag(facts: dict, candidates: list, quarter_num: int) -> tuple[str, list, list]:
+    """Return (tag, all_recs, period_recs) for the first candidate whose records match
+    the YTD duration for the given fiscal quarter (1=3M, 2=6M, 3=9M, 4=12M).
+    Falls back to relaxed window, then any records."""
+    lo, hi, rlo, rhi = _QUARTER_RANGES.get(quarter_num, _QUARTER_RANGES[1])
     any_tag, any_recs = "", []
-    relaxed_tag, relaxed_recs, relaxed_q = "", [], []
-
+    relaxed_tag, relaxed_recs, relaxed_f = "", [], []
     for tag in candidates:
         recs = _units(facts, tag)
         if not recs:
             continue
-        q = _filter_quarterly(recs, 75, 110)
-        if q:
-            return tag, recs, q
-        # Widen to ±2 weeks to catch fiscal-week-calendar quarters (e.g. 13×7=91±14)
-        q_wide = _filter_quarterly(recs, 60, 125)
-        if q_wide and not relaxed_tag:
-            relaxed_tag, relaxed_recs, relaxed_q = tag, recs, q_wide
+        f = _filter_duration(recs, lo, hi)
+        if f:
+            return tag, recs, f
+        fw = _filter_duration(recs, rlo, rhi)
+        if fw and not relaxed_tag:
+            relaxed_tag, relaxed_recs, relaxed_f = tag, recs, fw
         if not any_recs:
             any_tag, any_recs = tag, recs
-
     if relaxed_tag:
-        return relaxed_tag, relaxed_recs, relaxed_q
-    return any_tag, any_recs, []
-
-
-def _best_annual_tag(facts: dict, candidates: list) -> tuple[str, list, list]:
-    """Return (tag, all_recs, annual_recs) for the first candidate with full-year duration records."""
-    any_tag, any_recs = "", []
-    for tag in candidates:
-        recs = _units(facts, tag)
-        if not recs:
-            continue
-        a = _filter_annual(recs)
-        if a:
-            return tag, recs, a
-        if not any_recs:
-            any_tag, any_recs = tag, recs
+        return relaxed_tag, relaxed_recs, relaxed_f
     return any_tag, any_recs, []
 
 
@@ -433,16 +419,16 @@ def _find_closest(records: list, target: datetime, max_days: int = 45) -> dict |
     return best
 
 
-def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "10-Q") -> dict:
+_Q_PERIOD_LABELS = {1: "3ヶ月", 2: "6ヶ月累積", 3: "9ヶ月累積", 4: "通期（12ヶ月）"}
+
+
+def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "10-Q",
+               quarter_num: int = 1) -> dict:
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
-    is_annual = (form_type == "10-K")
+    effective_q = 4 if (form_type == "10-K") else quarter_num
     result = {}
     for metric, candidates in PL_TAGS.items():
-        # For 10-K use annual-duration records; for 10-Q use quarterly.
-        if is_annual:
-            tag, _recs, period_recs = _best_annual_tag(facts, candidates)
-        else:
-            tag, _recs, period_recs = _best_quarterly_tag(facts, candidates)
+        tag, _recs, period_recs = _best_ytd_tag(facts, candidates, effective_q)
         period_recs = _dedup_latest(period_recs, 30)
         current = prior = None
         if period_recs:
@@ -895,9 +881,12 @@ def _data_row(ws, row_num, label, cur, pri, is_bad_if_high: bool, formula: bool 
     _sc(ec, align=_R)
 
     fc = ws.cell(row=row_num, column=6)
-    if cur is not None and pri is not None and pri != 0:
-        fc.value = f"=IF(D{row_num}=0,\"\",(C{row_num}-D{row_num})/D{row_num})"
-        fc.number_format = FMT_PCT
+    if cur is not None and pri is not None:
+        pct_raw = (cur - pri) / abs(pri) if pri != 0 else None
+        pct_text = _pct_label(pct_raw, cur, pri, is_bad_if_high)
+        fc.value = pct_text
+        if pct_text in ("N/A", "黒字転換", "赤字転落"):
+            fc.font = _ITAL
     else:
         fc.value = "N/A"; fc.font = _ITAL
     _sc(fc, align=_C)
@@ -906,7 +895,7 @@ def _data_row(ws, row_num, label, cur, pri, is_bad_if_high: bool, formula: bool 
     return False
 
 
-def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs) -> dict:
+def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs, quarter_num: int = 1) -> dict:
     ws = wb.create_sheet("Financial Data")
     ws.views.sheetView[0].showGridLines = True
     _cw(ws, [3, 46, 18, 18, 18, 14])
@@ -926,7 +915,9 @@ def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs) -> dict:
     # ── PL section
     row = 4
     ws.merge_cells(f"A{row}:F{row}")
-    c = ws.cell(row=row, column=1, value="📊  損益計算書（P&L） — 前年同期比（YoY）")
+    _qlabel = _Q_PERIOD_LABELS.get(quarter_num, "")
+    c = ws.cell(row=row, column=1,
+                value=f"📊  損益計算書（P&L） — 前年同期比（YoY）  [{_qlabel}]")
     c.fill = _SEC_F; c.font = _D_BOLD; c.alignment = _L; ws.row_dimensions[row].height = 22; row += 1
 
     pl_cd = pl_pd = "—"
@@ -935,8 +926,8 @@ def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs) -> dict:
     for d in pl.values():
         if d.get("prior"):   pl_pd = d["prior"][1];   break
 
-    _hrow(ws, row, ["", "項目 / Metric", f"当期\n({pl_cd})\n[USD M]",
-                    f"前期\n({pl_pd})\n[USD M]", "差額 [USD M]", "変化率 %"])
+    _hrow(ws, row, ["", "項目 / Metric", f"当期\n({pl_cd})\n{_qlabel}\n[USD M]",
+                    f"前期\n({pl_pd})\n{_qlabel}\n[USD M]", "差額 [USD M]", "変化率 %"])
     ws.row_dimensions[row].height = 40; row += 1
 
     pl_order = [
@@ -1203,10 +1194,11 @@ def _build_mda_sheet(wb, mda_text: str, company_name: str, period: str):
 
 
 def build_excel(company_name: str, ticker: str, cik: str,
-                pl: dict, bs: dict, mda_text: str, period: str) -> bytes:
+                pl: dict, bs: dict, mda_text: str, period: str,
+                quarter_num: int = 1) -> bytes:
     wb = Workbook()
     del wb["Sheet"]
-    bs_rows_map = _build_fd_sheet(wb, company_name, ticker, cik, pl, bs)
+    bs_rows_map = _build_fd_sheet(wb, company_name, ticker, cik, pl, bs, quarter_num)
     _build_dashboard_sheet(wb, company_name, ticker, cik, pl, bs, bs_rows_map)
     _build_mda_sheet(wb, mda_text, company_name, period)
     wb.move_sheet("Dashboard", offset=-len(wb.sheetnames) + 1)
@@ -1383,9 +1375,14 @@ if demo_btn:
         st.markdown(_KPI_NOTES_MD)
     st.markdown("---")
 
-    st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
+    st.markdown(f"## 📊 損益計算書（P&L） — 前年同期比（YoY）  `{_Q_PERIOD_LABELS[1]}`")
     st.dataframe(_style_df(build_pl_df(pl)), width="stretch", height=270)
     st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
+    st.caption(
+        "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
+        "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
+        "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
+    )
 
     st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
     _bs_df = build_bs_df(bs)
@@ -1442,7 +1439,10 @@ elif st.session_state.get("filings"):
                 company_name = facts.get("entityName", ticker)
                 st.session_state.company_name = company_name
 
-            pl  = extract_pl(facts, period, form_type=selected.get("form", "10-Q"))
+            _q_num = _quarter_num(period, selected.get("fy_end", "1231")) \
+                     if selected.get("form") != "10-K" else 4
+            pl  = extract_pl(facts, period, form_type=selected.get("form", "10-Q"),
+                             quarter_num=_q_num)
             bs  = extract_bs(facts, period)
             mda = fetch_mda(cik, selected["accession"], selected["primary_doc"])
 
@@ -1468,9 +1468,15 @@ elif st.session_state.get("filings"):
             st.markdown(_KPI_NOTES_MD)
         st.markdown("---")
 
-        st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
+        _ql = _Q_PERIOD_LABELS.get(_q_num, "")
+        st.markdown(f"## 📊 損益計算書（P&L） — 前年同期比（YoY）  `{_ql}`")
         st.dataframe(_style_df(build_pl_df(pl)), width="stretch", height=270)
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
+        st.caption(
+            "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
+            "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
+            "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
+        )
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
         _bs_df = build_bs_df(bs)
@@ -1491,7 +1497,7 @@ elif st.session_state.get("filings"):
         st.markdown("## 📥 分析結果をExcelでダウンロード")
         st.markdown("Dashboard / Financial Data / MD&A_Text の3シート構成、数式・ハイライト付き。")
         with st.spinner("Excelファイルを生成中…"):
-            xls = build_excel(company_name, ticker, cik, pl, bs, mda or "", period)
+            xls = build_excel(company_name, ticker, cik, pl, bs, mda or "", period, _q_num)
         fname = f"{ticker.upper()}_financial_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         st.download_button("📥 分析結果をExcelでダウンロード", data=xls, file_name=fname,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
