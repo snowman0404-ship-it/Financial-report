@@ -260,6 +260,8 @@ def _strip_html(html: str) -> str:
 
 
 def extract_mda(html: str, max_chars: int = 30000) -> str:
+    # Remove table HTML — keep narrative prose only, skip financial data tables
+    html = re.sub(r'<table[\s>].*?</table>', ' ', html, flags=re.IGNORECASE | re.DOTALL)
     text = _strip_html(html)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -390,24 +392,18 @@ def extract_pl(facts: dict, target_period: str | None = None) -> dict:
                 prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
-    # Derive OperatingExpenses = Revenues - OperatingIncomeLoss (if not found or val is None)
-    def _val_is_missing(d, key):
-        t = d.get(key, {}).get("current")
-        return t is None or t[0] is None
-
-    if _val_is_missing(result, "OperatingExpenses"):
-        rev = result.get("Revenues", {})
-        opi = result.get("OperatingIncomeLoss", {})
-        for which in ("current", "prior"):
+    # Derive OperatingExpenses = Revenues - OperatingIncomeLoss per period independently
+    rev = result.get("Revenues", {})
+    opi = result.get("OperatingIncomeLoss", {})
+    for which in ("current", "prior"):
+        t = result.get("OperatingExpenses", {}).get(which)
+        if t is None or t[0] is None:
             r_t = rev.get(which)
             o_t = opi.get(which)
-            if r_t and o_t:
-                r_val, r_end, _ = r_t
-                o_val, o_end, _ = o_t
-                if r_val is not None and o_val is not None:
-                    if not result.get("OperatingExpenses"):
-                        result["OperatingExpenses"] = {}
-                    result["OperatingExpenses"][which] = (r_val - o_val, r_end, "※導出値: Revenues − OperatingIncomeLoss")
+            if r_t and o_t and r_t[0] is not None and o_t[0] is not None:
+                result.setdefault("OperatingExpenses", {})[which] = (
+                    r_t[0] - o_t[0], r_t[1], "※導出値: Revenues − OperatingIncomeLoss"
+                )
 
     return result
 
@@ -781,18 +777,68 @@ def compute_alerts(pl: dict, bs: dict) -> list[dict]:
     return alerts
 
 
+_ALERT_DEFS = [
+    ("PL-1", "収益性悪化",             "売上高より営業費用の伸び率が高い"),
+    ("PL-2", "コストコントロール不全",    "売上増にもかかわらず営業利益が低下"),
+    ("PL-3", "金融・本業外リスク",        "本業黒字でも税前利益がマイナスまたは大幅悪化"),
+    ("BS-1", "資金繰りショート懸念",      "現金QoQ −20%以上 かつ 流動負債QoQ +10%以上"),
+    ("BS-2", "在庫・売掛金の滞留リスク",  "現金減少局面でその他流動資産が急増"),
+    ("BS-3", "自己資本の減少",            "株主資本がQoQでマイナス"),
+]
+
+_KPI_NOTES_MD = """
+| 指標 | 見方・チェック理由 |
+|------|------------------|
+| **流動比率** | 短期の支払い能力を測定。**1.0未満**は1年以内の債務に対して現金化できる資産が不足＝黒字倒産リスクの警戒サイン。 |
+| **自己資本比率** | 中長期の倒産リスク（企業の頑丈さ）を測定。市況変動が激しいエネルギーセクターでは**30%以上**が健全目安。 |
+| **現金 QoQ** | 企業のリアルな体力ゲージ。QoQで**20%以上急減**している場合は、手元資金が急速に流出している警告シグナル。 |
+| **流動負債 QoQ** | 目の前に迫る支払いの増減。現金が減っている局面でここが激増＝短期資金繰りの**デッドクロス**リスク。 |
+| **株主資本 QoQ** | 基礎体力の増減。マイナスは本業赤字 or 身の丈に合わない配当・自社株買いで会社が細っているサイン。 |
+"""
+
+
 def _show_composite_alerts(alerts: list[dict]) -> None:
-    """Streamlit UIに複合アラートをレンダリングする。"""
+    """Streamlit UIに複合アラートをレンダリングする（全6条件の判定表 + KPI解説）。"""
+    triggered = {a["code"]: a["reason"] for a in alerts}
+    n = len(alerts)
+
     st.markdown("### 🚨 複合アラート判定（PL×3 / BS×3）")
-    if not alerts:
+
+    # Summary banner
+    if n == 0:
         st.success("✅ アラートなし — 6条件すべてで重大な財務悪化シグナルは検出されませんでした。")
-        return
-    for al in alerts:
-        st.markdown(
-            f'<div class="alert-box alert-red">⚠️ [{al["code"]}] {al["title"]} '
-            f'<span style="font-weight:400;font-size:.95rem;">— {al["reason"]}</span></div>',
-            unsafe_allow_html=True,
+    else:
+        st.error(f"⚠️ {n}件のアラートを検出 — 詳細は下表の判定理由を確認してください。")
+
+    # Full 6-condition table
+    rows_html = ""
+    for code, title, _cond in _ALERT_DEFS:
+        is_bad  = code in triggered
+        status  = "⚠️ アラート" if is_bad else "✅ 正常"
+        reason  = triggered.get(code, "—条件非該当—")
+        bg      = "#FFD2D2" if is_bad else "#D2FFD2"
+        rows_html += (
+            f'<tr style="background:{bg};">'
+            f'<td style="padding:4px 8px;font-weight:bold;">{status}</td>'
+            f'<td style="padding:4px 8px;font-weight:bold;">{code}</td>'
+            f'<td style="padding:4px 8px;">{title}</td>'
+            f'<td style="padding:4px 8px;color:#444;">{reason}</td>'
+            f'</tr>'
         )
+    st.markdown(
+        f'<table style="width:100%;border-collapse:collapse;font-size:.92rem;">'
+        f'<thead><tr style="background:#1F4E79;color:#fff;">'
+        f'<th style="padding:6px 8px;">判定</th>'
+        f'<th style="padding:6px 8px;">コード</th>'
+        f'<th style="padding:6px 8px;">アラート名</th>'
+        f'<th style="padding:6px 8px;">判定理由</th>'
+        f'</tr></thead><tbody>{rows_html}</tbody></table>',
+        unsafe_allow_html=True,
+    )
+
+    # KPI explanation expander
+    with st.expander("📖 各指標の見方・チェック理由", expanded=False):
+        st.markdown(_KPI_NOTES_MD)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Excel Builder (3 tabs)
@@ -1042,19 +1088,29 @@ def _build_dashboard_sheet(wb, company_name, ticker, cik, pl, bs, bs_rows_map):
         wd.row_dimensions[dr].height = 28; dr += 1
 
     ratios = compute_ratios(bs)
-    cr_v = ratios["current_ratio"]; er_v = ratios["equity_ratio"]
+    cr_v   = ratios["current_ratio"];   cr_p   = ratios["current_ratio_p"]
+    er_v   = ratios["equity_ratio"];    er_p   = ratios["equity_ratio_p"]
     cr_fill = _RED_F if (cr_v and cr_v < 1) else (_YLW_F if (cr_v and cr_v < 1.5) else _GRN_F)
     er_fill = _RED_F if (er_v is not None and er_v < 0.1) else (_YLW_F if (er_v is not None and er_v < 0.3) else _GRN_F)
+
+    def _cr_status(v): return '⚠️ <1.0 危険' if (v and v < 1) else ('⚡ 注意' if (v and v < 1.5) else '✅ 良好')
+    def _er_status(v): return '⚠️ <10% 危険' if (v is not None and v < 0.1) else ('⚡ <30% 低水準' if (v is not None and v < 0.3) else '✅ 良好')
 
     if ca_r and cl_r:
         _ratio_row("流動比率 / Current Ratio",
                    f"={fd}!C{ca_r}/{fd}!C{cl_r}", f"={fd}!D{ca_r}/{fd}!D{cl_r}", FMT_RATIO,
                    f'=IF(C{dr-1}<1,"⚠️ <1.0 危険",IF(C{dr-1}<1.5,"⚡ 注意","✅ 良好"))', cr_fill)
+    else:
+        _ratio_row("流動比率 / Current Ratio",
+                   cr_v, cr_p, FMT_RATIO, _cr_status(cr_v), cr_fill)
     if ca_r and nca_r and eq_r:
         ta_c = f"({fd}!C{ca_r}+{fd}!C{nca_r})"; ta_p = f"({fd}!D{ca_r}+{fd}!D{nca_r})"
         _ratio_row("自己資本比率 / Equity Ratio",
                    f"={fd}!C{eq_r}/{ta_c}", f"={fd}!D{eq_r}/{ta_p}", FMT_PCT,
                    f'=IF(C{dr-1}<0.1,"⚠️ <10% 危険",IF(C{dr-1}<0.3,"⚡ <30% 低水準","✅ 良好"))', er_fill)
+    else:
+        _ratio_row("自己資本比率 / Equity Ratio",
+                   er_v, er_p, FMT_PCT, _er_status(er_v), er_fill)
 
     dr += 1
     wd.merge_cells(f"A{dr}:G{dr}")
@@ -1345,26 +1401,14 @@ if demo_btn:
                 unsafe_allow_html=True)
     st.markdown(f"### 🏢 {company_name}  `{ticker}`  —  期間: `{period}`")
 
-    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    k1,k2,k3,k4,k5 = st.columns(5)
     def _ps(v): return f"{v:.1%}" if v is not None else "N/A"
     def _rs(v): return f"{v:.2f}" if v is not None else "N/A"
-    def _ms(v): return f"${v:,.0f}M" if v is not None else "N/A"
     k1.metric("流動比率", _rs(ratios["current_ratio"]))
     k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
     k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
     k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
     k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
-    k6.metric("現金残高", _ms(ratios["cash_cur"]))
-    with st.expander("📖 各指標の見方・チェック理由", expanded=False):
-        st.markdown("""
-| 指標 | 見方・チェック理由 |
-|------|------------------|
-| **流動比率** | 短期の支払い能力を測定。**1.0未満**は1年以内の債務に対して現金化できる資産が不足＝黒字倒産リスクの警戒サイン。 |
-| **自己資本比率** | 中長期の倒産リスク（企業の頑丈さ）を測定。市況変動が激しいエネルギーセクターでは**30%以上**が健全目安。 |
-| **現金残高 & 現金QoQ** | 企業のリアルな体力ゲージ。QoQで**20%以上急減**している場合は、手元資金が急速に流出している警告シグナル。 |
-| **流動負債 QoQ** | 目の前に迫る支払いの増減。現金が減っている局面でここが激増＝短期資金繰りの**デッドクロス**リスク。 |
-| **株主資本 QoQ** | 基礎体力の増減。マイナスは本業赤字 or 身の丈に合わない配当・自社株買いで会社が細っているサイン。 |
-""")
     _show_composite_alerts(compute_alerts(pl, bs))
     st.markdown("---")
 
@@ -1437,26 +1481,14 @@ elif st.session_state.get("filings"):
                     unsafe_allow_html=True)
         st.markdown(f"### 🏢 {company_name}  `{ticker.upper()}`  —  期間: `{period}`  ({selected['form']})")
 
-        k1,k2,k3,k4,k5,k6 = st.columns(6)
+        k1,k2,k3,k4,k5 = st.columns(5)
         def _ps(v): return f"{v:.1%}" if v is not None else "N/A"
         def _rs(v): return f"{v:.2f}" if v is not None else "N/A"
-        def _ms(v): return f"${v:,.0f}M" if v is not None else "N/A"
         k1.metric("流動比率", _rs(ratios["current_ratio"]))
         k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
         k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
         k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
         k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
-        k6.metric("現金残高", _ms(ratios["cash_cur"]))
-        with st.expander("📖 各指標の見方・チェック理由", expanded=False):
-            st.markdown("""
-| 指標 | 見方・チェック理由 |
-|------|------------------|
-| **流動比率** | 短期の支払い能力を測定。**1.0未満**は1年以内の債務に対して現金化できる資産が不足＝黒字倒産リスクの警戒サイン。 |
-| **自己資本比率** | 中長期の倒産リスク（企業の頑丈さ）を測定。市況変動が激しいエネルギーセクターでは**30%以上**が健全目安。 |
-| **現金残高 & 現金QoQ** | 企業のリアルな体力ゲージ。QoQで**20%以上急減**している場合は、手元資金が急速に流出している警告シグナル。 |
-| **流動負債 QoQ** | 目の前に迫る支払いの増減。現金が減っている局面でここが激増＝短期資金繰りの**デッドクロス**リスク。 |
-| **株主資本 QoQ** | 基礎体力の増減。マイナスは本業赤字 or 身の丈に合わない配当・自社株買いで会社が細っているサイン。 |
-""")
         _show_composite_alerts(compute_alerts(pl, bs))
         st.markdown("---")
 
