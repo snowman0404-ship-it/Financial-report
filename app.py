@@ -1775,12 +1775,11 @@ if st.session_state.get("filings"):
         _cik_int   = int(cik)
         _acc_nodash = _acc.replace("-", "")
         _doc_url   = f"https://www.sec.gov/Archives/edgar/data/{_cik_int}/{_acc_nodash}/{_doc}"
-        _idx_url   = f"https://www.sec.gov/Archives/edgar/data/{_cik_int}/{_acc_nodash}/"
         _search_url = (
             f"https://www.sec.gov/cgi-bin/browse-edgar"
             f"?action=getcompany&CIK={_cik_int}&type={_form_type}&dateb=&owner=include&count=10"
         )
-        _col1, _col2, _col3 = st.columns(3)
+        _col1, _col2 = st.columns(2)
         with _col1:
             st.link_button(
                 f"📑 {_form_type} 原本を開く（HTML）",
@@ -1788,12 +1787,6 @@ if st.session_state.get("filings"):
                 use_container_width=True,
             )
         with _col2:
-            st.link_button(
-                "🗂️ 添付ファイル一覧",
-                _idx_url,
-                use_container_width=True,
-            )
-        with _col3:
             st.link_button(
                 f"🔍 EDGAR {_form_type} 一覧",
                 _search_url,
