@@ -307,30 +307,31 @@ def _alert(pct, is_cost_or_liab: bool) -> str:
     return ("⚠️ -20%↓ 急減" if pct < -0.20 else
             ("✅ +20%↑ 成長" if pct > 0.20 else "✅ 正常"))
 
-def _style_row(row, pct_col="_pct", cost_col="_is_cost"):
-    """Return row-level CSS for alert highlighting."""
-    pct = row.get(pct_col)
-    is_cost = row.get(cost_col, False)
-    if pct is None:
-        return [""] * len(row)
-    triggered = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
-    bg = "background-color: #FFD2D2;" if triggered else ""
-    return [bg] * len(row)
-
 def _style_df(df: pd.DataFrame):
     display_cols = [c for c in df.columns if not c.startswith("_")]
+    display_df = df[display_cols].copy()
+
+    def highlight_row(row):
+        idx = row.name
+        pct     = df.loc[idx, "_pct"]
+        is_cost = df.loc[idx, "_is_cost"]
+        if pct is None:
+            return [""] * len(display_cols)
+        triggered = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
+        bg = "background-color: #FFD2D2;" if triggered else ""
+        return [bg] * len(display_cols)
+
+    fmt = {}
+    for c in display_cols:
+        if "USD M" in c or "差額" in c:
+            fmt[c] = lambda v: f"{v:,.1f}" if isinstance(v, (int, float)) else "N/A"
+    fmt["変化率 %"] = lambda v: f"{v:+.1%}" if isinstance(v, (int, float)) else "N/A"
+
     styled = (
-        df[display_cols]
+        display_df
         .style
-        .apply(lambda row: _style_row(df.loc[row.name]), axis=1)
-        .format(
-            {
-                c: lambda v: f"{v:,.1f}" if v is not None else "N/A"
-                for c in display_cols if "USD M" in c or "差額" in c
-            } | {
-                "変化率 %": lambda v: f"{v:+.1%}" if v is not None else "N/A"
-            }
-        )
+        .apply(highlight_row, axis=1)
+        .format(fmt)
         .set_properties(**{"text-align": "right"}, subset=[c for c in display_cols if c != "項目 / Metric" and c != "アラート"])
         .set_properties(**{"text-align": "left"},  subset=["項目 / Metric"])
         .set_properties(**{"text-align": "center"}, subset=["アラート"])
