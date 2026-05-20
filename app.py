@@ -55,36 +55,92 @@ def _get_stock_history(ticker: str):
 
 def _get_yf_info(ticker: str) -> dict:
     """Get key valuation metrics from yfinance."""
+    import math
+
+    def _sfv(v):
+        """Return v as a positive float, or None if invalid/nan/zero."""
+        try:
+            f = float(v)
+            return f if not math.isnan(f) and f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
-        # PE: trailing preferred; fall back to forward when trailing unavailable (e.g. loss year)
-        trailing_pe = info.get("trailingPE")
-        forward_pe  = info.get("forwardPE")
-        if trailing_pe and trailing_pe > 0:
+        t = yf.Ticker(ticker)
+
+        # fast_info is lighter and more reliable for price/market_cap
+        market_cap, price = None, None
+        try:
+            fi = t.fast_info
+            market_cap = _sfv(getattr(fi, "market_cap", None))
+            price      = _sfv(getattr(fi, "last_price", None))
+        except Exception:
+            pass
+
+        # full info dict for PE/PB fields
+        info = {}
+        try:
+            info = t.info or {}
+        except Exception:
+            pass
+
+        if not market_cap:
+            market_cap = _sfv(info.get("marketCap"))
+        if not price:
+            price = _sfv(info.get("currentPrice")) or _sfv(info.get("regularMarketPrice"))
+
+        # PE: trailing → forward
+        trailing_pe = _sfv(info.get("trailingPE"))
+        forward_pe  = _sfv(info.get("forwardPE"))
+        if trailing_pe:
             pe, pe_label = trailing_pe, "PER（実績）"
-        elif forward_pe and forward_pe > 0:
+        elif forward_pe:
             pe, pe_label = forward_pe, "PER（予想）"
         else:
             pe, pe_label = None, "PER"
-        # PBR: priceToBook preferred; compute from marketCap/bookValue if missing
-        pb = info.get("priceToBook")
+
+        # PBR: priceToBook → compute from bookValue per share
+        pb = _sfv(info.get("priceToBook"))
         if not pb:
-            mc = info.get("marketCap")
-            bv = info.get("bookValue")    # per-share book value
-            sh = info.get("sharesOutstanding")
-            if mc and bv and sh and bv > 0:
-                pb = mc / (bv * sh)
+            bv = _sfv(info.get("bookValue"))       # dollars per share
+            sh = _sfv(info.get("sharesOutstanding"))
+            if market_cap and bv and sh:
+                pb = _sfv(market_cap / (bv * sh))
+
         return {
-            "price":      info.get("currentPrice") or info.get("regularMarketPrice"),
+            "price":      price,
             "pe":         pe,
             "pe_label":   pe_label,
             "pb":         pb,
-            "market_cap": info.get("marketCap"),
-            "shares":     info.get("sharesOutstanding"),
+            "market_cap": market_cap,
+            "shares":     _sfv(info.get("sharesOutstanding")),
         }
     except Exception:
         return {}
+
+
+def _edgar_per_pbr(bs: dict, pl: dict, market_cap: float | None):
+    """Compute PER/PBR from EDGAR data + market cap when yfinance fields are unavailable."""
+    import math
+
+    def _raw(d, key):
+        v = d.get(key, {}).get("current")
+        try:
+            f = float(v[0])
+            return f if not math.isnan(f) else None
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    net_income = _raw(pl, "NetIncomeLoss")
+    equity     = _raw(bs, "StockholdersEquity")
+
+    per, per_label, pbr = None, "PER（EDGAR試算）", None
+    if market_cap and net_income and net_income > 0:
+        per = market_cap / net_income
+    if market_cap and equity and equity > 0:
+        pbr = market_cap / equity
+    return per, per_label, pbr
 
 
 def compute_altman_z(bs: dict, pl: dict):
@@ -1767,13 +1823,18 @@ if st.session_state.get("filings"):
             yf_info = _get_yf_info(ticker)
             z_data = compute_altman_z(bs, pl)
 
-            # PER
+            # PER / PBR — yfinance first, then EDGAR+market_cap fallback
             pe       = yf_info.get("pe")
             pe_label = yf_info.get("pe_label", "PER（株価収益率）")
-            st.metric(pe_label, f"{pe:.1f}倍" if pe else "N/A")
+            pb       = yf_info.get("pb")
+            if not pe or not pb:
+                _ep, _el, _epb = _edgar_per_pbr(bs, pl, yf_info.get("market_cap"))
+                if not pe and _ep:
+                    pe, pe_label = _ep, _el
+                if not pb and _epb:
+                    pb = _epb
 
-            # PBR
-            pb = yf_info.get("pb")
+            st.metric(pe_label, f"{pe:.1f}倍" if pe else "N/A")
             st.metric("PBR（株価純資産倍率）", f"{pb:.1f}倍" if pb else "N/A")
 
             # Altman Z
