@@ -309,31 +309,40 @@ def _alert(pct, is_cost_or_liab: bool) -> str:
 
 def _style_df(df: pd.DataFrame):
     display_cols = [c for c in df.columns if not c.startswith("_")]
-    display_df = df[display_cols].copy()
+    display_df = df[display_cols].reset_index(drop=True)
 
     def highlight_row(row):
-        idx = row.name
-        pct     = df.loc[idx, "_pct"]
-        is_cost = df.loc[idx, "_is_cost"]
+        idx     = row.name
+        pct     = df.iloc[idx]["_pct"]
+        is_cost = df.iloc[idx]["_is_cost"]
         if pct is None:
-            return [""] * len(display_cols)
-        triggered = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
-        bg = "background-color: #FFD2D2;" if triggered else ""
-        return [bg] * len(display_cols)
+            bg = ""
+        else:
+            triggered = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
+            bg = "background-color: #FFD2D2;" if triggered else ""
+        return pd.Series([bg] * len(display_cols), index=display_cols)
+
+    def fmt_usd(v):
+        return f"{v:,.1f}" if isinstance(v, (int, float)) else "N/A"
+
+    def fmt_pct(v):
+        return f"{v:+.1%}" if isinstance(v, (int, float)) else "N/A"
 
     fmt = {}
     for c in display_cols:
         if "USD M" in c or "差額" in c:
-            fmt[c] = lambda v: f"{v:,.1f}" if isinstance(v, (int, float)) else "N/A"
-    fmt["変化率 %"] = lambda v: f"{v:+.1%}" if isinstance(v, (int, float)) else "N/A"
+            fmt[c] = fmt_usd
+    fmt["変化率 %"] = fmt_pct
+
+    right_cols = [c for c in display_cols if c not in ("項目 / Metric", "アラート")]
 
     styled = (
         display_df
         .style
         .apply(highlight_row, axis=1)
         .format(fmt)
-        .set_properties(**{"text-align": "right"}, subset=[c for c in display_cols if c != "項目 / Metric" and c != "アラート"])
-        .set_properties(**{"text-align": "left"},  subset=["項目 / Metric"])
+        .set_properties(**{"text-align": "right"},  subset=right_cols)
+        .set_properties(**{"text-align": "left"},   subset=["項目 / Metric"])
         .set_properties(**{"text-align": "center"}, subset=["アラート"])
     )
     return styled
