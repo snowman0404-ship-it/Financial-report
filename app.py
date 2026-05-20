@@ -42,21 +42,30 @@ def _search_tickers(query: str) -> list:
 
 
 def _get_chart_data(ticker: str):
-    """Fetch 5Y daily close for ticker and S&P500 (^GSPC).
-    Returns (stock_df, sp500_df) aligned to a common start date, or (None, None).
+    """Fetch 5Y daily close for ticker and optionally S&P500 (^GSPC).
+    Returns (stock_df, sp500_df_or_None). stock_df is None only on total failure.
+    S&P500 is fetched independently; failure returns None for that series only.
     """
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker).history(period="5y", interval="1d")[["Close"]]
-        sp500 = yf.Ticker("^GSPC").history(period="5y", interval="1d")[["Close"]]
-        if stock.empty or sp500.empty:
+        if stock.empty:
             return None, None
-        start = max(stock.index[0], sp500.index[0])
-        stock = stock[stock.index >= start]
-        sp500 = sp500[sp500.index >= start]
-        return stock, sp500
     except Exception:
         return None, None
+
+    sp500 = None
+    try:
+        import yfinance as yf
+        _sp = yf.Ticker("^GSPC").history(period="5y", interval="1d")[["Close"]]
+        if not _sp.empty:
+            start = max(stock.index[0], _sp.index[0])
+            stock = stock[stock.index >= start]
+            sp500 = _sp[_sp.index >= start]
+    except Exception:
+        pass
+
+    return stock, sp500
 
 
 def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
@@ -1861,18 +1870,20 @@ if st.session_state.get("filings"):
             with st.spinner("株価データを取得中..."):
                 _stock, _sp500 = _get_chart_data(ticker)
             if _stock is not None and not _stock.empty:
-                try:
-                    import plotly.graph_objects as go
+                import plotly.graph_objects as go
+                _fig = go.Figure()
+                # ── 企業株価（左軸） ──
+                _fig.add_trace(go.Scatter(
+                    x=_stock.index,
+                    y=_stock["Close"].round(2),
+                    name=f"{ticker.upper()} 株価",
+                    line=dict(color="#2563EB", width=1.5),
+                    yaxis="y1",
+                    hovertemplate="%{x|%Y-%m-%d}<br>株価: $%{y:,.2f}<extra></extra>",
+                ))
+                # ── S&P500 騰落率（右軸）※取得できた場合のみ ──
+                if _sp500 is not None and not _sp500.empty:
                     _sp_pct = (_sp500["Close"] / _sp500["Close"].iloc[0] - 1) * 100
-                    _fig = go.Figure()
-                    _fig.add_trace(go.Scatter(
-                        x=_stock.index,
-                        y=_stock["Close"].round(2),
-                        name=f"{ticker.upper()} 株価",
-                        line=dict(color="#2563EB", width=1.5),
-                        yaxis="y1",
-                        hovertemplate="%{x|%Y-%m-%d}<br>株価: $%{y:,.2f}<extra></extra>",
-                    ))
                     _fig.add_trace(go.Scatter(
                         x=_sp500.index,
                         y=_sp_pct.round(2),
@@ -1881,38 +1892,38 @@ if st.session_state.get("filings"):
                         yaxis="y2",
                         hovertemplate="%{x|%Y-%m-%d}<br>S&P500: %{y:+.1f}%<extra></extra>",
                     ))
-                    _fig.update_layout(
-                        height=340,
-                        margin=dict(l=0, r=0, t=10, b=0),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                                    xanchor="right", x=1),
-                        hovermode="x unified",
-                        plot_bgcolor="white",
-                        paper_bgcolor="white",
-                        xaxis=dict(showgrid=False, zeroline=False),
-                        yaxis=dict(
-                            title=f"{ticker.upper()} 株価 (USD)",
-                            titlefont=dict(color="#2563EB"),
-                            tickfont=dict(color="#2563EB"),
-                            showgrid=True,
-                            gridcolor="#F3F4F6",
-                            zeroline=False,
-                        ),
-                        yaxis2=dict(
-                            title="S&P500 騰落率 (%)",
-                            titlefont=dict(color="#9CA3AF"),
-                            tickfont=dict(color="#9CA3AF"),
-                            overlaying="y",
-                            side="right",
-                            showgrid=False,
-                            zeroline=True,
-                            zerolinecolor="#E5E7EB",
-                            ticksuffix="%",
-                        ),
+                _layout = dict(
+                    height=340,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                                xanchor="right", x=1),
+                    hovermode="x unified",
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                    xaxis=dict(showgrid=False, zeroline=False),
+                    yaxis=dict(
+                        title=f"{ticker.upper()} 株価 (USD)",
+                        titlefont=dict(color="#2563EB"),
+                        tickfont=dict(color="#2563EB"),
+                        showgrid=True,
+                        gridcolor="#F3F4F6",
+                        zeroline=False,
+                    ),
+                )
+                if _sp500 is not None:
+                    _layout["yaxis2"] = dict(
+                        title="S&P500 騰落率 (%)",
+                        titlefont=dict(color="#9CA3AF"),
+                        tickfont=dict(color="#9CA3AF"),
+                        overlaying="y",
+                        side="right",
+                        showgrid=False,
+                        zeroline=True,
+                        zerolinecolor="#E5E7EB",
+                        ticksuffix="%",
                     )
-                    st.plotly_chart(_fig, use_container_width=True)
-                except Exception:
-                    st.line_chart(_stock, height=300)
+                _fig.update_layout(**_layout)
+                st.plotly_chart(_fig, use_container_width=True)
             else:
                 st.info("株価データを取得できませんでした（ネットワーク制限の可能性があります）")
 
