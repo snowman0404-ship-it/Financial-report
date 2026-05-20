@@ -1213,11 +1213,11 @@ if demo_btn:
     st.markdown("---")
 
     st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
-    st.dataframe(_style_df(build_pl_df(pl)), use_container_width=True, height=270)
+    st.dataframe(_style_df(build_pl_df(pl)), width="stretch", height=270)
     st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
     st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-    st.dataframe(_style_df(build_bs_df(bs)), use_container_width=True, height=310)
+    st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=310)
 
     st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
     st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
@@ -1294,11 +1294,11 @@ elif st.session_state.get("filings"):
         st.markdown("---")
 
         st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）3ヶ月実績")
-        st.dataframe(_style_df(build_pl_df(pl)), use_container_width=True, height=270)
+        st.dataframe(_style_df(build_pl_df(pl)), width="stretch", height=270)
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-        st.dataframe(_style_df(build_bs_df(bs)), use_container_width=True, height=310)
+        st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=310)
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
