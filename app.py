@@ -34,34 +34,50 @@ KNOWN_CIKS = {
 
 PL_TAGS = {
     "Revenues": [
-        "Revenues", "SalesRevenueNet",
         "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueGoodsNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+        "SalesRevenueGoodsNet",
         "SalesAndRevenuesNet",
+        "RevenuesNetOfInterestExpense",
+        "RealEstateRevenueNet",
     ],
     "OperatingExpenses": [
-        "CostOfGoodsAndServicesSold", "CostOfRevenue",
-        "OperatingExpenses", "CostsAndExpenses", "CostOfGoodsSold",
+        "CostOfGoodsAndServicesSold",
+        "CostOfRevenue",
+        "CostOfGoodsSold",
+        "OperatingExpenses",
+        "CostsAndExpenses",
+        "CostOfRevenueExcludingDepreciation",
     ],
     "OperatingIncomeLoss": [
         "OperatingIncomeLoss",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "OperatingIncomeLossFromContinuingOperations",
     ],
     "InterestExpense": [
-        "NonoperatingIncomeExpense", "InterestExpense",
-        "InterestIncomeExpenseNet", "InterestAndDebtExpense",
+        "NonoperatingIncomeExpense",
+        "InterestAndDividendIncomeOperating",
+        "InterestExpense",
+        "InterestIncomeExpenseNet",
+        "InterestAndDebtExpense",
         "OtherNonoperatingIncomeExpense",
+        "InvestmentIncomeNonoperating",
     ],
     "IncomeLossBeforeTax": [
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign",
     ],
     "NetIncomeLoss": [
-        "NetIncomeLoss", "ProfitLoss",
+        "NetIncomeLoss",
         "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "ProfitLoss",
         "IncomeLossFromContinuingOperations",
+        "NetIncomeLossAttributableToParentCompany",
+        "NetIncomeLossIncludingPortionAttributableToNoncontrollingInterest",
     ],
 }
 
@@ -162,7 +178,7 @@ def _filter_quarterly(records: list) -> list:
         if s and e:
             try:
                 d = (datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(s, "%Y-%m-%d")).days
-                if 80 <= d <= 100:
+                if 75 <= d <= 110:  # 3ヶ月四半期の許容幅を広げる
                     out.append(r)
             except ValueError:
                 pass
@@ -323,10 +339,14 @@ def _style_df(df: pd.DataFrame):
         return pd.Series([bg] * len(display_cols), index=display_cols)
 
     def fmt_usd(v):
-        return f"{v:,.1f}" if isinstance(v, (int, float)) else "N/A"
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "N/A"
+        return f"{v:,.1f}"
 
     def fmt_pct(v):
-        return f"{v:+.1%}" if isinstance(v, (int, float)) else "N/A"
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "N/A"
+        return f"{v:+.1%}"
 
     fmt = {}
     for c in display_cols:
@@ -340,7 +360,7 @@ def _style_df(df: pd.DataFrame):
         display_df
         .style
         .apply(highlight_row, axis=1)
-        .format(fmt)
+        .format(fmt, na_rep="N/A")
         .set_properties(**{"text-align": "right"},  subset=right_cols)
         .set_properties(**{"text-align": "left"},   subset=["項目 / Metric"])
         .set_properties(**{"text-align": "center"}, subset=["アラート"])
