@@ -347,6 +347,21 @@ def _filter_quarterly(records: list, lo: int = 75, hi: int = 110) -> list:
     return out
 
 
+def _filter_annual(records: list) -> list:
+    """Filter for full-year duration records (340-400 days)."""
+    out = []
+    for r in records:
+        s, e = r.get("start", ""), r.get("end", "")
+        if s and e:
+            try:
+                d = (datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(s, "%Y-%m-%d")).days
+                if 340 <= d <= 400:
+                    out.append(r)
+            except ValueError:
+                pass
+    return out
+
+
 def _best_quarterly_tag(facts: dict, candidates: list) -> tuple[str, list, list]:
     """Return (tag, all_recs, quarterly_recs) for the first candidate that has quarterly data.
 
@@ -378,6 +393,21 @@ def _best_quarterly_tag(facts: dict, candidates: list) -> tuple[str, list, list]
     return any_tag, any_recs, []
 
 
+def _best_annual_tag(facts: dict, candidates: list) -> tuple[str, list, list]:
+    """Return (tag, all_recs, annual_recs) for the first candidate with full-year duration records."""
+    any_tag, any_recs = "", []
+    for tag in candidates:
+        recs = _units(facts, tag)
+        if not recs:
+            continue
+        a = _filter_annual(recs)
+        if a:
+            return tag, recs, a
+        if not any_recs:
+            any_tag, any_recs = tag, recs
+    return any_tag, any_recs, []
+
+
 def _filter_instant(records: list) -> list:
     return [r for r in records if not r.get("start")]
 
@@ -403,24 +433,26 @@ def _find_closest(records: list, target: datetime, max_days: int = 45) -> dict |
     return best
 
 
-def extract_pl(facts: dict, target_period: str | None = None) -> dict:
+def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "10-Q") -> dict:
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
+    is_annual = (form_type == "10-K")
     result = {}
     for metric, candidates in PL_TAGS.items():
-        # Use _best_quarterly_tag so we skip through candidate tags until we find
-        # one with actual quarterly-duration records, not just any records.
-        tag, _recs, quarterly = _best_quarterly_tag(facts, candidates)
-        quarterly = _dedup_latest(quarterly, 30)
+        # For 10-K use annual-duration records; for 10-Q use quarterly.
+        if is_annual:
+            tag, _recs, period_recs = _best_annual_tag(facts, candidates)
+        else:
+            tag, _recs, period_recs = _best_quarterly_tag(facts, candidates)
+        period_recs = _dedup_latest(period_recs, 30)
         current = prior = None
-        if quarterly:
-            cur_rec = _find_closest(quarterly, target, 65) if target else quarterly[0]
-            # Do NOT fall back to quarterly[0] when a target is specified —
-            # returning data for the wrong period is worse than returning None.
+        if period_recs:
+            cur_rec = _find_closest(period_recs, target, 65) if target else period_recs[0]
             if cur_rec is not None:
                 current = (cur_rec.get("val"), cur_rec["end"], tag)
                 cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+                # YoY: go back exactly one year for both quarterly and annual
                 prior_target = cur_end - timedelta(days=365)
-                others = [r for r in quarterly if r["end"] != cur_rec["end"]]
+                others = [r for r in period_recs if r["end"] != cur_rec["end"]]
                 prior_rec = _find_closest(others, prior_target, 65)
                 if prior_rec:
                     prior = (prior_rec.get("val"), prior_rec["end"], tag)
@@ -650,6 +682,28 @@ def build_bs_df(bs: dict) -> pd.DataFrame:
                   [cl_c, ltl_c, eq_c], [cl_p, ltl_p, eq_p]),
     ]
     return pd.DataFrame(rows)
+
+
+def _bs_imbalance_note(df: pd.DataFrame) -> str:
+    """Return a warning note when Assets total ≠ Liabilities+Equity total."""
+    sub = df[df["_is_subtotal"] == True]
+    if len(sub) < 2:
+        return ""
+    cur_cols = [c for c in df.columns if "当" in c and "USD" in c]
+    if not cur_cols:
+        return ""
+    try:
+        a  = float(sub.iloc[0][cur_cols[0]])
+        le = float(sub.iloc[1][cur_cols[0]])
+        if abs(a - le) > 1.0:   # > $1M 差異で表示
+            return (
+                "※ 資産合計と負債・資本合計が一致していません。"
+                "株主資本（StockholdersEquity）は親会社株主に帰属する持分のみであり、"
+                "非支配株主持分（Non-controlling Interests）が含まれていない可能性があります。"
+            )
+    except (TypeError, ValueError):
+        pass
+    return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pandas Styler
@@ -886,12 +940,12 @@ def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs) -> dict:
     ws.row_dimensions[row].height = 40; row += 1
 
     pl_order = [
-        ("Revenues",            "売上高 / Revenues",               False),
-        ("OperatingExpenses",   "営業費用 / Operating Expenses",   True),
-        ("OperatingIncomeLoss", "営業利益 / Operating Income",     False),
-        ("InterestExpense",     "金融損益 / Non-Op. Income/Exp.", False),
-        ("IncomeLossBeforeTax", "税引前利益 / Income Before Tax",  False),
-        ("NetIncomeLoss",       "純利益 / Net Income",             False),
+        ("Revenues",            "売上高 / Revenues",                          False),
+        ("OperatingExpenses",   "営業費用 / Operating Expenses",              True),
+        ("OperatingIncomeLoss", "営業利益 / Operating Income",                False),
+        ("InterestExpense",     "営業外費用 / Total Other Expense, net",      False),
+        ("IncomeLossBeforeTax", "税引前利益 / Income Before Tax",             False),
+        ("NetIncomeLoss",       "純利益 / Net Income",                        False),
     ]
     bs_rows_map = {}
     for key, label, is_liab in pl_order:
@@ -927,36 +981,74 @@ def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs) -> dict:
                     f"前四半期末\n({bs_pd})\n[USD M]", "差額 [USD M]", "変化率 %"])
     ws.row_dimensions[row].height = 40; row += 1
 
-    bs_order = [
-        ("Cash",               "手元資金 / Cash & Equivalents",   False),
-        ("CurrentLiabilities", "流動負債 / Current Liabilities",  True),
-        ("LongTermLiabilities","長期負債 / LT Liabilities",       True),
-        ("NonCurrentAssets",   "固定資産 / Non-Current Assets",   False),
-        ("StockholdersEquity", "株主資本 / Stockholders' Equity", False),
-    ]
-    for key, label, is_liab in bs_order:
-        data = bs.get(key, {})
-        cur  = _mval(data["current"][0]) if data.get("current") else None
-        pri  = _mval(data["prior"][0])   if data.get("prior")   else None
-        bs_rows_map[key] = row
-        _data_row(ws, row, label, cur, pri, is_liab)
-        row += 1
+    def _bsv(key, which):
+        d = bs.get(key, {})
+        return _mval(d[which][0]) if d.get(which) else None
 
-    # Other Current Assets
-    cash_r = bs_rows_map.get("Cash"); ca_r = bs_rows_map.get("CurrentAssets")
-    ws.cell(row=row, column=1).fill = _GRY_F; _sc(ws.cell(row=row, column=1))
-    lc = ws.cell(row=row, column=2, value="その他流動資産 / Other Current Assets (=CurrentAssets−Cash)")
-    lc.font = Font(name="Calibri", size=10, italic=True); lc.alignment = _L; lc.border = _BORDER
-    if cash_r and ca_r:
-        for col_idx, formula in [(3, f"=C{ca_r}-C{cash_r}"), (4, f"=D{ca_r}-D{cash_r}")]:
-            c2 = ws.cell(row=row, column=col_idx, value=formula); c2.number_format = FMT_USD; _sc(c2, align=_R)
-        e2 = ws.cell(row=row, column=5, value=f"=C{row}-D{row}"); e2.number_format = FMT_USD; _sc(e2, align=_R)
-        f2 = ws.cell(row=row, column=6, value=f"=IF(D{row}=0,\"\",(C{row}-D{row})/D{row})"); f2.number_format = FMT_PCT; _sc(f2, align=_C)
-    else:
-        for col in range(3, 8):
-            c2 = ws.cell(row=row, column=col, value="N/A"); c2.font = _ITAL; c2.border = _BORDER
-    ws.cell(row=row, column=6).border = _BORDER
-    ws.row_dimensions[row].height = 18; row += 2
+    def _subtotal_row(label, cur_f, pri_f):
+        nonlocal row
+        ws.cell(row=row, column=1).fill = _SEC_F; ws.cell(row=row, column=1).border = _BORDER
+        lc = ws.cell(row=row, column=2, value=label)
+        lc.fill = _SEC_F; lc.font = _D_BOLD; lc.alignment = _L; lc.border = _BORDER
+        cc = ws.cell(row=row, column=3, value=cur_f)
+        cc.number_format = FMT_USD; _sc(cc, fill=_SEC_F, align=_R); cc.font = _D_BOLD
+        dc = ws.cell(row=row, column=4, value=pri_f)
+        dc.number_format = FMT_USD; _sc(dc, fill=_SEC_F, align=_R); dc.font = _D_BOLD
+        ec = ws.cell(row=row, column=5, value=f"=C{row}-D{row}")
+        ec.number_format = FMT_USD; _sc(ec, fill=_SEC_F, align=_R); ec.font = _D_BOLD
+        fc = ws.cell(row=row, column=6); fc.value = ""; fc.fill = _SEC_F; fc.border = _BORDER
+        ws.row_dimensions[row].height = 20; row += 1
+
+    # ── Assets section ──────────────────────────────────────────────────────
+    # Cash
+    cash_c = _bsv("Cash", "current"); cash_p = _bsv("Cash", "prior")
+    bs_rows_map["Cash"] = row
+    _data_row(ws, row, "手元資金 / Cash & Equivalents", cash_c, cash_p, False); row += 1
+
+    # Other Current Assets (computed from CurrentAssets - Cash)
+    ca_c = _bsv("CurrentAssets", "current"); ca_p = _bsv("CurrentAssets", "prior")
+    oca_c = (ca_c - cash_c) if (ca_c is not None and cash_c is not None) else None
+    oca_p = (ca_p - cash_p) if (ca_p is not None and cash_p is not None) else None
+    bs_rows_map["OCA"] = row
+    _data_row(ws, row, "その他流動資産 / Other Current Assets", oca_c, oca_p, False); row += 1
+
+    # Non-Current Assets
+    nca_c = _bsv("NonCurrentAssets", "current"); nca_p = _bsv("NonCurrentAssets", "prior")
+    bs_rows_map["NonCurrentAssets"] = row
+    _data_row(ws, row, "固定資産 / Non-Current Assets", nca_c, nca_p, False); row += 1
+
+    # Total Assets subtotal
+    ta_rows = [bs_rows_map["Cash"], bs_rows_map["OCA"], bs_rows_map["NonCurrentAssets"]]
+    ta_f_c = "+".join(f"C{r}" for r in ta_rows)
+    ta_f_p = "+".join(f"D{r}" for r in ta_rows)
+    bs_rows_map["TotalAssetsRow"] = row
+    _subtotal_row("▶ 資産合計 / Total Assets", f"={ta_f_c}", f"={ta_f_p}")
+
+    # ── Liabilities & Equity section ────────────────────────────────────────
+    cl_c = _bsv("CurrentLiabilities", "current"); cl_p = _bsv("CurrentLiabilities", "prior")
+    bs_rows_map["CurrentLiabilities"] = row
+    _data_row(ws, row, "流動負債 / Current Liabilities", cl_c, cl_p, True); row += 1
+
+    ltl_c = _bsv("LongTermLiabilities", "current"); ltl_p = _bsv("LongTermLiabilities", "prior")
+    bs_rows_map["LongTermLiabilities"] = row
+    _data_row(ws, row, "長期負債 / LT Liabilities", ltl_c, ltl_p, True); row += 1
+
+    eq_c = _bsv("StockholdersEquity", "current"); eq_p = _bsv("StockholdersEquity", "prior")
+    bs_rows_map["StockholdersEquity"] = row
+    _data_row(ws, row, "株主資本 / Stockholders' Equity", eq_c, eq_p, False); row += 1
+
+    # Total L+E subtotal
+    le_rows = [bs_rows_map["CurrentLiabilities"], bs_rows_map["LongTermLiabilities"], bs_rows_map["StockholdersEquity"]]
+    le_f_c = "+".join(f"C{r}" for r in le_rows)
+    le_f_p = "+".join(f"D{r}" for r in le_rows)
+    bs_rows_map["TotalLERow"] = row
+    _subtotal_row("▶ 負債・資本合計 / Total L+E", f"={le_f_c}", f"={le_f_p}")
+    row += 1
+
+    ws.merge_cells(f"A{row}:F{row}")
+    note = ws.cell(row=row, column=1,
+                   value="※ 資産合計≠負債・資本合計の場合、株主資本は親会社帰属分のみで非支配株主持分が未計上の可能性があります。")
+    note.font = _ITAL; note.fill = _GRY_F; note.alignment = _L; ws.row_dimensions[row].height = 14; row += 1
 
     ws.merge_cells(f"A{row}:F{row}")
     leg = ws.cell(row=row, column=1,
@@ -1296,7 +1388,11 @@ if demo_btn:
     st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
     st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-    st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=340)
+    _bs_df = build_bs_df(bs)
+    st.dataframe(_style_df(_bs_df), width="stretch", height=340)
+    _bs_note = _bs_imbalance_note(_bs_df)
+    if _bs_note:
+        st.caption(_bs_note)
 
     st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
     st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
@@ -1346,7 +1442,7 @@ elif st.session_state.get("filings"):
                 company_name = facts.get("entityName", ticker)
                 st.session_state.company_name = company_name
 
-            pl  = extract_pl(facts, period)
+            pl  = extract_pl(facts, period, form_type=selected.get("form", "10-Q"))
             bs  = extract_bs(facts, period)
             mda = fetch_mda(cik, selected["accession"], selected["primary_doc"])
 
@@ -1377,7 +1473,11 @@ elif st.session_state.get("filings"):
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-        st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=340)
+        _bs_df = build_bs_df(bs)
+    st.dataframe(_style_df(_bs_df), width="stretch", height=340)
+    _bs_note = _bs_imbalance_note(_bs_df)
+    if _bs_note:
+        st.caption(_bs_note)
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
