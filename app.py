@@ -128,7 +128,7 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
         shares = None
         for _ns in ("dei", "us-gaap"):
             for _tag in ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"):
-                _sh = facts.get(_ns, {}).get(_tag, {}).get("units", {}).get("shares", [])
+                _sh = facts.get("facts", {}).get(_ns, {}).get(_tag, {}).get("units", {}).get("shares", [])
                 if _sh:
                     _sh = sorted(_sh, key=lambda r: r.get("end", ""), reverse=True)
                     shares = _fpos(_sh[0].get("val"))
@@ -147,7 +147,7 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
                     pb = mc / eq
 
             if not pe:
-                _ni_all = facts.get("us-gaap", {}).get("NetIncomeLoss", {}) \
+                _ni_all = facts.get("facts", {}).get("us-gaap", {}).get("NetIncomeLoss", {}) \
                                .get("units", {}).get("USD", [])
                 _annual = sorted(
                     [r for r in _ni_all
@@ -720,7 +720,7 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
 
     for metric, candidates in tag_set.items():
         tag, _recs, period_recs = _best_ytd_tag(facts, candidates, effective_q)
-        period_recs = _dedup_latest(period_recs, 30)
+        period_recs = _dedup_latest(period_recs, 100)
         current = prior = None
         if period_recs:
             cur_rec = _find_closest(period_recs, target, 65) if target else period_recs[0]
@@ -758,7 +758,7 @@ def extract_bs(facts: dict, target_period: str | None = None) -> dict:
     result = {}
     for metric, candidates in BS_TAGS.items():
         tag, recs = _best_tag(facts, candidates)
-        instants = _dedup_latest(_filter_instant(recs), 12)
+        instants = _dedup_latest(_filter_instant(recs), 100)
         current = prior = None
         if instants:
             cur_rec = _find_closest(instants, target, 65) if target else instants[0]
