@@ -1892,7 +1892,8 @@ if st.session_state.get("filings"):
                         yaxis="y2",
                         hovertemplate="%{x|%Y-%m-%d}<br>S&P500: %{y:+.1f}%<extra></extra>",
                     ))
-                _layout = dict(
+                # 共通レイアウト（titlefont は Plotly 5.x で廃止 → title_font を使用）
+                _fig.update_layout(
                     height=340,
                     margin=dict(l=0, r=0, t=10, b=0),
                     legend=dict(orientation="h", yanchor="bottom", y=1.01,
@@ -1903,26 +1904,28 @@ if st.session_state.get("filings"):
                     xaxis=dict(showgrid=False, zeroline=False),
                     yaxis=dict(
                         title=f"{ticker.upper()} 株価 (USD)",
-                        titlefont=dict(color="#2563EB"),
+                        title_font_color="#2563EB",
                         tickfont=dict(color="#2563EB"),
                         showgrid=True,
                         gridcolor="#F3F4F6",
                         zeroline=False,
                     ),
                 )
-                if _sp500 is not None:
-                    _layout["yaxis2"] = dict(
-                        title="S&P500 騰落率 (%)",
-                        titlefont=dict(color="#9CA3AF"),
-                        tickfont=dict(color="#9CA3AF"),
-                        overlaying="y",
-                        side="right",
-                        showgrid=False,
-                        zeroline=True,
-                        zerolinecolor="#E5E7EB",
-                        ticksuffix="%",
+                # 右軸は S&P500 取得時のみ追加
+                if _sp500 is not None and not _sp500.empty:
+                    _fig.update_layout(
+                        yaxis2=dict(
+                            title="S&P500 騰落率 (%)",
+                            title_font_color="#9CA3AF",
+                            tickfont=dict(color="#9CA3AF"),
+                            overlaying="y",
+                            side="right",
+                            showgrid=False,
+                            zeroline=True,
+                            zerolinecolor="#E5E7EB",
+                            ticksuffix="%",
+                        )
                     )
-                _fig.update_layout(**_layout)
                 st.plotly_chart(_fig, use_container_width=True)
             else:
                 st.info("株価データを取得できませんでした（ネットワーク制限の可能性があります）")
