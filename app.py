@@ -687,6 +687,102 @@ def risk_verdict(r: dict) -> tuple[str, str, str]:
         return "— データ不足：判定不可\nInsufficient data.", "#F2F2F2", "⚪"
     return "✅ 現時点で重大なリスクシグナルなし\nNo major risk signals detected.", "#D2FFD2", "🟢"
 
+
+def compute_alerts(pl: dict, bs: dict) -> list[dict]:
+    """6条件の複合アラート（PL×3 + BS×3）を返す。"""
+    def _v(data, key, which):
+        t = data.get(key, {}).get(which)
+        return _m(t[0]) if (t is not None and t[0] is not None) else None
+
+    def _pct(cur, pri):
+        if cur is None or pri is None:
+            return None
+        try:
+            if abs(float(pri)) < 1e-9:
+                return None
+            return (float(cur) - float(pri)) / abs(float(pri))
+        except (TypeError, ValueError):
+            return None
+
+    def _fp(pct, cur, pri):
+        if pct is None:
+            return "N/A"
+        if cur is not None and pri is not None:
+            if pri < 0 and cur >= 0:
+                return "黒字転換"
+            if pri >= 0 and cur < 0:
+                return "赤字転落"
+        return f"{pct:+.1%}"
+
+    rev_c  = _v(pl, "Revenues",            "current"); rev_p  = _v(pl, "Revenues",            "prior")
+    opex_c = _v(pl, "OperatingExpenses",   "current"); opex_p = _v(pl, "OperatingExpenses",   "prior")
+    opi_c  = _v(pl, "OperatingIncomeLoss", "current"); opi_p  = _v(pl, "OperatingIncomeLoss", "prior")
+    ibt_c  = _v(pl, "IncomeLossBeforeTax", "current"); ibt_p  = _v(pl, "IncomeLossBeforeTax", "prior")
+    cash_c = _v(bs, "Cash",               "current");  cash_p = _v(bs, "Cash",               "prior")
+    cl_c   = _v(bs, "CurrentLiabilities", "current");  cl_p   = _v(bs, "CurrentLiabilities", "prior")
+    ca_c   = _v(bs, "CurrentAssets",      "current");  ca_p   = _v(bs, "CurrentAssets",      "prior")
+    eq_c   = _v(bs, "StockholdersEquity", "current");  eq_p   = _v(bs, "StockholdersEquity", "prior")
+
+    oca_c = (ca_c - cash_c) if (ca_c is not None and cash_c is not None) else None
+    oca_p = (ca_p - cash_p) if (ca_p is not None and cash_p is not None) else None
+
+    rev_chg  = _pct(rev_c,  rev_p);  opex_chg = _pct(opex_c, opex_p)
+    opi_chg  = _pct(opi_c,  opi_p);  ibt_chg  = _pct(ibt_c,  ibt_p)
+    cash_chg = _pct(cash_c, cash_p); cl_chg   = _pct(cl_c,   cl_p)
+    oca_chg  = _pct(oca_c,  oca_p);  eq_chg   = _pct(eq_c,   eq_p)
+
+    alerts = []
+
+    # PL-1: 収益性悪化
+    if rev_chg is not None and opex_chg is not None and rev_chg < opex_chg:
+        alerts.append({"code": "PL-1", "type": "PL", "title": "収益性悪化",
+                        "reason": f"売上高変化率 {_fp(rev_chg, rev_c, rev_p)} < 営業費用変化率 {_fp(opex_chg, opex_c, opex_p)}"})
+
+    # PL-2: コストコントロール不全
+    if rev_chg is not None and rev_chg >= 0 and opi_chg is not None and opi_chg < 0:
+        alerts.append({"code": "PL-2", "type": "PL", "title": "コストコントロール不全",
+                        "reason": f"増収（売上 {_fp(rev_chg, rev_c, rev_p)}）にもかかわらず営業利益 {_fp(opi_chg, opi_c, opi_p)}"})
+
+    # PL-3: 金融・本業外リスク
+    if opi_c is not None and opi_c > 0 and ibt_c is not None:
+        if ibt_c < 0:
+            alerts.append({"code": "PL-3", "type": "PL", "title": "金融・本業外リスク",
+                            "reason": f"営業利益 +{opi_c:,.1f}M なのに税引前利益がマイナス（{ibt_c:,.1f}M）"})
+        elif ibt_chg is not None and ibt_chg <= -0.20:
+            alerts.append({"code": "PL-3", "type": "PL", "title": "金融・本業外リスク",
+                            "reason": f"営業利益プラスなのに税引前利益が大幅減少（{_fp(ibt_chg, ibt_c, ibt_p)}）"})
+
+    # BS-1: 資金繰りショート懸念
+    if cash_chg is not None and cash_chg <= -0.20 and cl_chg is not None and cl_chg >= 0.10:
+        alerts.append({"code": "BS-1", "type": "BS", "title": "資金繰りショート懸念",
+                        "reason": f"手元資金 {_fp(cash_chg, cash_c, cash_p)} かつ 流動負債 {_fp(cl_chg, cl_c, cl_p)}"})
+
+    # BS-2: 在庫・売掛金の滞留リスク
+    if cash_chg is not None and cash_chg < 0 and oca_chg is not None and oca_chg >= 0.20:
+        alerts.append({"code": "BS-2", "type": "BS", "title": "在庫・売掛金の滞留リスク",
+                        "reason": f"手元資金 {_fp(cash_chg, cash_c, cash_p)} かつ その他流動資産 {_fp(oca_chg, oca_c, oca_p)}"})
+
+    # BS-3: 自己資本の減少
+    if eq_chg is not None and eq_chg < 0:
+        alerts.append({"code": "BS-3", "type": "BS", "title": "自己資本の減少",
+                        "reason": f"株主資本変化率 {_fp(eq_chg, eq_c, eq_p)}"})
+
+    return alerts
+
+
+def _show_composite_alerts(alerts: list[dict]) -> None:
+    """Streamlit UIに複合アラートをレンダリングする。"""
+    st.markdown("### 🚨 複合アラート判定（PL×3 / BS×3）")
+    if not alerts:
+        st.success("✅ アラートなし — 6条件すべてで重大な財務悪化シグナルは検出されませんでした。")
+        return
+    for al in alerts:
+        st.markdown(
+            f'<div class="alert-box alert-red">⚠️ [{al["code"]}] {al["title"]} '
+            f'<span style="font-weight:400;font-size:.95rem;">— {al["reason"]}</span></div>',
+            unsafe_allow_html=True,
+        )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Excel Builder (3 tabs)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -960,48 +1056,50 @@ def _build_dashboard_sheet(wb, company_name, ticker, cik, pl, bs, bs_rows_map):
 
     dr += 1
     wd.merge_cells(f"A{dr}:G{dr}")
-    c = wd.cell(row=dr, column=1, value="🚨  倒産予兆・資金繰りリスク判定")
+    c = wd.cell(row=dr, column=1, value="🚨  複合アラート判定（PL×3 / BS×3）")
     c.fill = PatternFill("solid", fgColor="C00000")
     c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=12)
     c.alignment = _L; wd.row_dimensions[dr].height = 26; dr += 1
-    _hrow(wd, dr, ["", "チェック項目", "実績値", "判定基準", "状態", "", ""]); wd.row_dimensions[dr].height = 20; dr += 1
+    _hrow(wd, dr, ["", "コード", "アラート名", "判定理由", "状態", "", ""]); wd.row_dimensions[dr].height = 20; dr += 1
 
-    r = ratios
-    def _risk_row(label, pct, cur_v, pri_v, threshold, bad_cond):
-        nonlocal dr
-        is_bad = bad_cond(pct) if pct is not None else False
+    composite_alerts = compute_alerts(pl, bs)
+    all_codes = ["PL-1", "PL-2", "PL-3", "BS-1", "BS-2", "BS-3"]
+    all_titles = {
+        "PL-1": "収益性悪化",           "PL-2": "コストコントロール不全",
+        "PL-3": "金融・本業外リスク",   "BS-1": "資金繰りショート懸念",
+        "BS-2": "在庫・売掛金の滞留リスク", "BS-3": "自己資本の減少",
+    }
+    triggered = {a["code"]: a["reason"] for a in composite_alerts}
+    for code in all_codes:
+        is_bad = code in triggered
         wd.cell(row=dr, column=1).border = _BORDER
-        lc = wd.cell(row=dr, column=2, value=label); _sc(lc, font=_NORM, align=_L)
-        if pct is not None and cur_v is not None and pri_v is not None:
-            result = f"{pct:+.1%}  ({pri_v:,.0f}M → {cur_v:,.0f}M)"
-        else:
-            result = "N/A"
-        rc = wd.cell(row=dr, column=3, value=result); _sc(rc, font=_NORM, align=_C)
-        tc = wd.cell(row=dr, column=4, value=threshold); _sc(tc, font=_ITAL, align=_C)
-        sc = wd.cell(row=dr, column=5, value="⚠️ 要注意" if is_bad else "✅ 正常")
+        _sc(wd.cell(row=dr, column=2, value=code), font=Font(name="Calibri", bold=True, size=10), align=_C)
+        _sc(wd.cell(row=dr, column=3, value=all_titles[code]), font=_NORM, align=_L)
+        reason_cell = wd.cell(row=dr, column=4, value=triggered.get(code, "—条件非該当—"))
+        _sc(reason_cell, font=_NORM, align=_L)
+        sc = wd.cell(row=dr, column=5, value="⚠️ アラート" if is_bad else "✅ 正常")
         _sc(sc, fill=(_RED_F if is_bad else _GRN_F), align=_C)
+        if is_bad:
+            for col in [2, 3, 4]:
+                wd.cell(row=dr, column=col).fill = PatternFill("solid", fgColor="FFD2D2")
         for col in [6, 7]: wd.cell(row=dr, column=col).border = _BORDER
         wd.row_dimensions[dr].height = 18; dr += 1
 
-    _risk_row("手元資金 QoQ変化", r["cash_qoq"], r["cash_cur"], r["cash_pri"], "< -20% で警告", lambda p: p < -0.20)
-    _risk_row("流動負債 QoQ変化", r["cl_qoq"],   r["cl_cur"],   r["cl_pri"],   "> +20% で警告", lambda p: p > 0.20)
-    _risk_row("株主資本 QoQ変化", r["eq_qoq"],   r["eq_cur"],   r["eq_pri"],   "< -20% で警告", lambda p: p < -0.20)
-
     dr += 1
     wd.merge_cells(f"A{dr}:G{dr}")
-    wd.cell(row=dr, column=1, value="総合リスク判定 / Overall Risk Verdict").fill = _SUB_F
-    wd.cell(row=dr, column=1).font = _W_BOLD; wd.cell(row=dr, column=1).alignment = _C
-    wd.row_dimensions[dr].height = 22; dr += 1
-
-    verdict_txt, verdict_hex, _ = risk_verdict(r)
-    wd.merge_cells(f"A{dr}:G{dr}")
-    vc = wd.cell(row=dr, column=1, value=verdict_txt)
-    vc.fill = PatternFill("solid", fgColor=verdict_hex.lstrip("#"))
-    vc.font = Font(name="Calibri", bold=True, size=13,
-                   color="C00000" if "FFD2D2" in verdict_hex else
-                         ("7F6000" if "FACD" in verdict_hex else "1E6B2E"))
+    n_alerts = len(composite_alerts)
+    if n_alerts == 0:
+        overall_txt = "✅ アラートなし — 6条件すべてで重大な財務悪化シグナルは検出されませんでした"
+        overall_fill = PatternFill("solid", fgColor="D2FFD2")
+        overall_font = Font(name="Calibri", bold=True, size=12, color="1E6B2E")
+    else:
+        overall_txt = f"⚠️ {n_alerts}件のアラートを検出 — 詳細は上記の判定理由を確認してください"
+        overall_fill = PatternFill("solid", fgColor="FFD2D2")
+        overall_font = Font(name="Calibri", bold=True, size=12, color="C00000")
+    vc = wd.cell(row=dr, column=1, value=overall_txt)
+    vc.fill = overall_fill; vc.font = overall_font
     vc.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    wd.row_dimensions[dr].height = 44; dr += 2
+    wd.row_dimensions[dr].height = 30; dr += 2
 
     wd.merge_cells(f"A{dr}:G{dr}")
     dis = wd.cell(row=dr, column=1,
@@ -1218,6 +1316,7 @@ if demo_btn:
     k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
     k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
     k6.metric("現金残高", _ms(ratios["cash_cur"]))
+    _show_composite_alerts(compute_alerts(pl, bs))
     st.markdown("---")
 
     st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
@@ -1299,6 +1398,7 @@ elif st.session_state.get("filings"):
         k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
         k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
         k6.metric("現金残高", _ms(ratios["cash_cur"]))
+        _show_composite_alerts(compute_alerts(pl, bs))
         st.markdown("---")
 
         st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）3ヶ月実績")
