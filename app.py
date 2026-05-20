@@ -1,26 +1,30 @@
 """
-SEC EDGAR Financial Analyzer — Streamlit Web App
+SEC EDGAR Financial Analyzer — Streamlit Web App (v2)
 Run: streamlit run app.py
 Dependencies: pip install streamlit pandas requests openpyxl
 """
 
 import io
+import re
 import time
 import requests
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta
+from html.parser import HTMLParser
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants
+# Constants & Tag Maps
 # ─────────────────────────────────────────────────────────────────────────────
 
-USER_AGENT = "FinancialAnalyzer/1.0 (financial-analyzer@example.com)"
-EDGAR_TICKER_API = "https://www.sec.gov/files/company_tickers.json"
-EDGAR_FACTS_API  = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+USER_AGENT = "FinancialWebAnalyzer/1.0 (financial-analyzer@example.com)"
+EDGAR_TICKER_API   = "https://www.sec.gov/files/company_tickers.json"
+EDGAR_SUBMISSIONS  = "https://data.sec.gov/submissions/CIK{cik}.json"
+EDGAR_FACTS_API    = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+EDGAR_ARCHIVES     = "https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}"
 
 KNOWN_CIKS = {
     "PARR": "0001378590", "XOM":  "0000034088", "CVX":  "0000093410",
@@ -36,48 +40,32 @@ PL_TAGS = {
     "Revenues": [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
-        "Revenues",
-        "SalesRevenueNet",
-        "SalesRevenueGoodsNet",
-        "SalesAndRevenuesNet",
-        "RevenuesNetOfInterestExpense",
-        "RealEstateRevenueNet",
+        "Revenues", "SalesRevenueNet", "SalesRevenueGoodsNet",
+        "SalesAndRevenuesNet", "RevenuesNetOfInterestExpense",
     ],
     "OperatingExpenses": [
-        "CostOfGoodsAndServicesSold",
-        "CostOfRevenue",
-        "CostOfGoodsSold",
-        "OperatingExpenses",
-        "CostsAndExpenses",
-        "CostOfRevenueExcludingDepreciation",
+        "CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsSold",
+        "OperatingExpenses", "CostsAndExpenses",
     ],
     "OperatingIncomeLoss": [
         "OperatingIncomeLoss",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-        "OperatingIncomeLossFromContinuingOperations",
     ],
     "InterestExpense": [
-        "NonoperatingIncomeExpense",
-        "InterestAndDividendIncomeOperating",
-        "InterestExpense",
-        "InterestIncomeExpenseNet",
-        "InterestAndDebtExpense",
+        "NonoperatingIncomeExpense", "InterestExpense",
+        "InterestIncomeExpenseNet", "InterestAndDebtExpense",
         "OtherNonoperatingIncomeExpense",
-        "InvestmentIncomeNonoperating",
     ],
     "IncomeLossBeforeTax": [
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesForeign",
     ],
     "NetIncomeLoss": [
-        "NetIncomeLoss",
+        "NetIncomeLoss", "ProfitLoss",
         "NetIncomeLossAvailableToCommonStockholdersBasic",
-        "ProfitLoss",
         "IncomeLossFromContinuingOperations",
         "NetIncomeLossAttributableToParentCompany",
-        "NetIncomeLossIncludingPortionAttributableToNoncontrollingInterest",
     ],
 }
 
@@ -87,8 +75,8 @@ BS_TAGS = {
         "CashCashEquivalentsAndShortTermInvestments",
         "CashAndShortTermInvestments", "Cash",
     ],
-    "CurrentLiabilities": ["LiabilitiesCurrent", "LiabilitiesCurrentAndNoncurrent"],
-    "CurrentAssets":      ["AssetsCurrent", "AssetsCurrentAndNoncurrent"],
+    "CurrentLiabilities": ["LiabilitiesCurrent"],
+    "CurrentAssets":      ["AssetsCurrent"],
     "LongTermLiabilities": [
         "LiabilitiesNoncurrent", "LongTermDebtNoncurrent",
         "LongTermDebt", "LongTermDebtAndCapitalLeaseObligations",
@@ -121,18 +109,18 @@ BS_LABELS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Data Fetching & Extraction  (shared with financial_analyzer.py logic)
+# HTTP Helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _headers():
-    return {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    return {"User-Agent": USER_AGENT, "Accept": "application/json, text/html"}
 
-def _get(url: str, retries: int = 4, backoff: float = 2.0):
+def _get(url: str, retries: int = 4, backoff: float = 2.0, as_text: bool = False):
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=_headers(), timeout=30)
             if r.status_code == 200:
-                return r
+                return r.text if as_text else r
             if r.status_code == 429:
                 time.sleep(backoff * (2 ** attempt))
                 continue
@@ -140,6 +128,10 @@ def _get(url: str, retries: int = 4, backoff: float = 2.0):
         except requests.RequestException:
             time.sleep(backoff * (2 ** attempt))
     return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CIK Resolution
+# ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_cik(ticker: str) -> tuple[str | None, str]:
     t = ticker.upper()
@@ -152,17 +144,138 @@ def resolve_cik(ticker: str) -> tuple[str | None, str]:
         return KNOWN_CIKS[t], t
     return None, ""
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Filings List (10-Q / 10-K)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_filings_list(cik: str) -> list[dict]:
+    """Return list of dicts for recent 10-Q and 10-K filings."""
+    r = _get(EDGAR_SUBMISSIONS.format(cik=cik))
+    if not r:
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        return []
+    recent = data.get("filings", {}).get("recent", {})
+    forms      = recent.get("form", [])
+    dates      = recent.get("filingDate", [])
+    periods    = recent.get("reportDate", [])
+    accessions = recent.get("accessionNumber", [])
+    prim_docs  = recent.get("primaryDocument", [])
+
+    result = []
+    for form, date, period, acc, doc in zip(forms, dates, periods, accessions, prim_docs):
+        if form in ("10-Q", "10-K") and period:
+            result.append({
+                "form": form,
+                "date": date,
+                "period": period,
+                "accession": acc,
+                "primary_doc": doc,
+                "label": f"{form} — {period}（提出日: {date}）",
+            })
+    return result[:24]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MD&A Extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _HTMLStripper(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._parts = []
+        self._skip = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head"):
+            self._skip = True
+        if tag in ("p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4"):
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head"):
+            self._skip = False
+
+    def handle_data(self, data):
+        if not self._skip:
+            self._parts.append(data)
+
+    def get_text(self):
+        return "".join(self._parts)
+
+
+def _strip_html(html: str) -> str:
+    s = _HTMLStripper()
+    try:
+        s.feed(html)
+        return s.get_text()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", html)
+
+
+def extract_mda(html: str, max_chars: int = 30000) -> str:
+    text = _strip_html(html)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    start_pats = [
+        r"(?im)^[\s ]*(ITEM\s*2[\.\:\-—\s]+MANAGEMENT.{0,80}DISCUSSION)",
+        r"(?im)(Management[’\']s\s+Discussion\s+and\s+Analysis\s+of\s+Financial)",
+        r"(?im)(MANAGEMENT[’\']S\s+DISCUSSION\s+AND\s+ANALYSIS)",
+    ]
+    start = -1
+    for pat in start_pats:
+        m = re.search(pat, text)
+        if m:
+            start = m.start()
+            break
+
+    if start == -1:
+        return text[:max_chars].strip()
+
+    end_pats = [
+        r"(?im)^[\s ]*(ITEM\s*3[\.\:\-—\s]+QUANTITATIVE)",
+        r"(?im)^[\s ]*(ITEM\s*3[\.\:\-—\s]+MARKET\s+RISK)",
+        r"(?im)^[\s ]*(ITEM\s*3[\.\:\-—\s])",
+    ]
+    tail = text[start + 200:]
+    end_offset = len(tail)
+    for pat in end_pats:
+        m = re.search(pat, tail)
+        if m:
+            end_offset = min(end_offset, m.start())
+            break
+
+    mda = text[start: start + 200 + end_offset].strip()
+    return mda[:max_chars]
+
+
+def fetch_mda(cik: str, accession: str, primary_doc: str) -> str:
+    cik_int    = int(cik)
+    acc_nodash = accession.replace("-", "")
+    url = EDGAR_ARCHIVES.format(cik_int=cik_int, acc_nodash=acc_nodash, doc=primary_doc)
+    html = _get(url, as_text=True)
+    if not html:
+        return "（MD&Aテキストを取得できませんでした。SECのネットワーク制限またはファイル形式の問題の可能性があります。）"
+    return extract_mda(html)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XBRL Fact Fetching & Extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
 def fetch_facts(cik: str) -> dict:
     r = _get(EDGAR_FACTS_API.format(cik=cik))
     return r.json() if r else {}
 
+
 def _units(facts: dict, tag: str) -> list:
     try:
-        gaap = facts.get("facts", {}).get("us-gaap", {})
-        u = gaap.get(tag, {}).get("units", {})
+        u = facts.get("facts", {}).get("us-gaap", {}).get(tag, {}).get("units", {})
         return u.get("USD", u.get("pure", []))
     except Exception:
         return []
+
 
 def _best_tag(facts: dict, candidates: list) -> tuple[str, list]:
     for tag in candidates:
@@ -171,6 +284,7 @@ def _best_tag(facts: dict, candidates: list) -> tuple[str, list]:
             return tag, recs
     return "", []
 
+
 def _filter_quarterly(records: list) -> list:
     out = []
     for r in records:
@@ -178,11 +292,16 @@ def _filter_quarterly(records: list) -> list:
         if s and e:
             try:
                 d = (datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(s, "%Y-%m-%d")).days
-                if 75 <= d <= 110:  # 3ヶ月四半期の許容幅を広げる
+                if 75 <= d <= 110:
                     out.append(r)
             except ValueError:
                 pass
     return out
+
+
+def _filter_instant(records: list) -> list:
+    return [r for r in records if not r.get("start")]
+
 
 def _dedup_latest(records: list, n: int) -> list:
     seen = {}
@@ -192,150 +311,167 @@ def _dedup_latest(records: list, n: int) -> list:
             seen[e] = r
     return sorted(seen.values(), key=lambda x: x.get("end", ""), reverse=True)[:n]
 
-def _filter_instant(records: list) -> list:
-    return [r for r in records if not r.get("start")]
 
-def extract_pl(facts: dict) -> dict:
+def _find_closest(records: list, target: datetime, max_days: int = 45) -> dict | None:
+    best, best_d = None, max_days + 1
+    for r in records:
+        try:
+            diff = abs((datetime.strptime(r["end"], "%Y-%m-%d") - target).days)
+            if diff < best_d:
+                best, best_d = r, diff
+        except (ValueError, KeyError):
+            pass
+    return best
+
+
+def extract_pl(facts: dict, target_period: str | None = None) -> dict:
+    target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
     result = {}
     for metric, candidates in PL_TAGS.items():
         tag, recs = _best_tag(facts, candidates)
-        quarterly = _dedup_latest(_filter_quarterly(recs), 8)
+        quarterly = _dedup_latest(_filter_quarterly(recs), 30)
         current = prior = None
         if quarterly:
-            cr = quarterly[0]
-            current = (cr.get("val"), cr["end"], tag)
-            target = datetime.strptime(cr["end"], "%Y-%m-%d") - timedelta(days=365)
-            best, best_d = None, 999
-            for r in quarterly[1:]:
-                d = abs((datetime.strptime(r["end"], "%Y-%m-%d") - target).days)
-                if d < 46 and d < best_d:
-                    best, best_d = r, d
-            if best:
-                prior = (best.get("val"), best["end"], tag)
+            cur_rec = _find_closest(quarterly, target, 45) if target else quarterly[0]
+            if cur_rec is None:
+                cur_rec = quarterly[0]
+            current = (cur_rec.get("val"), cur_rec["end"], tag)
+            cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+            prior_target = cur_end - timedelta(days=365)
+            others = [r for r in quarterly if r["end"] != cur_rec["end"]]
+            prior_rec = _find_closest(others, prior_target, 46)
+            if prior_rec:
+                prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
     return result
 
-def extract_bs(facts: dict) -> dict:
+
+def extract_bs(facts: dict, target_period: str | None = None) -> dict:
+    target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
     result = {}
     for metric, candidates in BS_TAGS.items():
         tag, recs = _best_tag(facts, candidates)
-        latest = _dedup_latest(_filter_instant(recs), 4)
-        current = (latest[0].get("val"), latest[0]["end"], tag) if latest else None
-        prior   = (latest[1].get("val"), latest[1]["end"], tag) if len(latest) > 1 else None
+        instants = _dedup_latest(_filter_instant(recs), 8)
+        current = prior = None
+        if instants:
+            cur_rec = _find_closest(instants, target, 45) if target else instants[0]
+            if cur_rec is None:
+                cur_rec = instants[0]
+            current = (cur_rec.get("val"), cur_rec["end"], tag)
+            cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+            prior_target = cur_end - timedelta(days=92)
+            others = [r for r in instants if r["end"] != cur_rec["end"]]
+            prior_rec = _find_closest(others, prior_target, 46)
+            if prior_rec:
+                prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
     return result
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DataFrame Builders
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _m(val):
-    """Convert raw value to USD millions float, or None."""
     try:
         return float(val) / 1_000_000 if val is not None else None
     except (TypeError, ValueError):
         return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build DataFrames for Streamlit display
-# ─────────────────────────────────────────────────────────────────────────────
+
+def _alert(pct, is_bad_if_high: bool) -> str:
+    if pct is None:
+        return "—"
+    if is_bad_if_high:
+        return "⚠️ +20%↑ 急増" if pct > 0.20 else "✅ 正常"
+    return "⚠️ -20%↓ 急減" if pct < -0.20 else ("✅ +20%↑ 成長" if pct > 0.20 else "✅ 正常")
+
 
 def build_pl_df(pl: dict) -> pd.DataFrame:
     rows = []
     for key, label in PL_LABELS.items():
-        data = pl.get(key, {})
-        cur  = _m(data["current"][0]) if data.get("current") else None
-        pri  = _m(data["prior"][0])   if data.get("prior")   else None
-        tag  = data["current"][2] if data.get("current") else "—"
-        cdp  = data["current"][1] if data.get("current") else "—"
-        pdp  = data["prior"][1]   if data.get("prior")   else "—"
-        delta = cur - pri if cur is not None and pri is not None else None
-        pct   = delta / abs(pri) if delta is not None and pri not in (None, 0) else None
+        data  = pl.get(key, {})
+        cur   = _m(data["current"][0]) if data.get("current") else None
+        pri   = _m(data["prior"][0])   if data.get("prior")   else None
+        cdp   = data["current"][1]     if data.get("current") else "—"
+        pdp   = data["prior"][1]       if data.get("prior")   else "—"
+        tag   = data["current"][2]     if data.get("current") else "—"
+        delta = (cur - pri)            if (cur is not None and pri is not None) else None
+        pct   = delta / abs(pri)       if (delta is not None and pri not in (None, 0)) else None
         is_cost = key == "OperatingExpenses"
-        alert = _alert(pct, is_cost)
         rows.append({
-            "項目 / Metric":   label,
-            f"当期 ({cdp})\n[USD M]": cur,
-            f"前期 ({pdp})\n[USD M]": pri,
-            "差額 [USD M]":   delta,
-            "変化率 %":        pct,
-            "アラート":        alert,
-            "_pct":           pct,
-            "_is_cost":       is_cost,
-            "_tag":           tag,
+            "項目 / Metric":              label,
+            f"当期 ({cdp})\n[USD M]":    cur,
+            f"前期 ({pdp})\n[USD M]":    pri,
+            "差額 [USD M]":              delta,
+            "変化率 %":                   pct,
+            "アラート":                   _alert(pct, is_cost),
+            "_pct": pct, "_is_cost": is_cost, "_cdp": cdp, "_pdp": pdp, "_tag": tag,
         })
     return pd.DataFrame(rows)
+
 
 def build_bs_df(bs: dict) -> pd.DataFrame:
     rows = []
-    # Other Current Assets (derived)
-    extra_labels = {**BS_LABELS}
-    for key, label in extra_labels.items():
-        data = bs.get(key, {})
-        cur  = _m(data["current"][0]) if data.get("current") else None
-        pri  = _m(data["prior"][0])   if data.get("prior")   else None
-        tag  = data["current"][2] if data.get("current") else "—"
-        cdp  = data["current"][1] if data.get("current") else "—"
-        pdp  = data["prior"][1]   if data.get("prior")   else "—"
-        delta = cur - pri if cur is not None and pri is not None else None
-        pct   = delta / abs(pri) if delta is not None and pri not in (None, 0) else None
+    cdp_global = pdp_global = "—"
+    for key, label in BS_LABELS.items():
+        data   = bs.get(key, {})
+        cur    = _m(data["current"][0]) if data.get("current") else None
+        pri    = _m(data["prior"][0])   if data.get("prior")   else None
+        cdp    = data["current"][1]     if data.get("current") else "—"
+        pdp    = data["prior"][1]       if data.get("prior")   else "—"
+        tag    = data["current"][2]     if data.get("current") else "—"
+        delta  = (cur - pri)            if (cur is not None and pri is not None) else None
+        pct    = delta / abs(pri)       if (delta is not None and pri not in (None, 0)) else None
         is_liab = key in ("CurrentLiabilities", "LongTermLiabilities")
-        alert = _alert(pct, is_liab)
+        if cdp != "—":
+            cdp_global = cdp
+        if pdp != "—":
+            pdp_global = pdp
         rows.append({
-            "項目 / Metric":   label,
-            f"当四半期末 ({cdp})\n[USD M]": cur,
-            f"前四半期末 ({pdp})\n[USD M]": pri,
-            "差額 [USD M]":   delta,
-            "変化率 %":        pct,
-            "アラート":        alert,
-            "_pct":           pct,
-            "_is_cost":       is_liab,
-            "_tag":           tag,
+            "項目 / Metric":                     label,
+            f"当四半期末 ({cdp})\n[USD M]":      cur,
+            f"前四半期末 ({pdp})\n[USD M]":      pri,
+            "差額 [USD M]":                      delta,
+            "変化率 %":                           pct,
+            "アラート":                           _alert(pct, is_liab),
+            "_pct": pct, "_is_cost": is_liab, "_tag": tag,
         })
-    # Other Current Assets = CurrentAssets - Cash
-    ca  = _m(bs.get("CurrentAssets",  {}).get("current", (None,))[0])
-    ca_p= _m(bs.get("CurrentAssets",  {}).get("prior",   (None,))[0])
-    ca_d= bs.get("CurrentAssets",  {}).get("current", (None, "—"))[1]
-    ca_dp=bs.get("CurrentAssets",  {}).get("prior",   (None, "—"))[1]
-    cash= _m(bs.get("Cash",           {}).get("current", (None,))[0])
-    cash_p=_m(bs.get("Cash",          {}).get("prior",   (None,))[0])
-    if ca is not None and cash is not None:
-        oca  = ca - cash
-        oca_p= (ca_p - cash_p) if (ca_p is not None and cash_p is not None) else None
-        delta = oca - oca_p if oca_p is not None else None
-        pct   = delta / abs(oca_p) if delta is not None and oca_p not in (None, 0) else None
-    else:
-        oca = oca_p = delta = pct = None
+    # Other Current Assets (derived)
+    ca   = _m(bs.get("CurrentAssets", {}).get("current", (None,))[0])
+    ca_p = _m(bs.get("CurrentAssets", {}).get("prior",   (None,))[0])
+    cash = _m(bs.get("Cash",          {}).get("current", (None,))[0])
+    cashp= _m(bs.get("Cash",          {}).get("prior",   (None,))[0])
+    oca  = (ca - cash)     if (ca is not None and cash is not None)   else None
+    ocap = (ca_p - cashp)  if (ca_p is not None and cashp is not None) else None
+    oca_d= (oca - ocap)   if (oca is not None and ocap is not None)  else None
+    oca_pct = oca_d / abs(ocap) if (oca_d is not None and ocap not in (None, 0)) else None
     rows.append({
-        "項目 / Metric":   "その他流動資産 / Other Current Assets (=CurrentAssets−Cash)",
-        f"当四半期末 ({ca_d})\n[USD M]": oca,
-        f"前四半期末 ({ca_dp})\n[USD M]": oca_p,
-        "差額 [USD M]":   delta,
-        "変化率 %":        pct,
-        "アラート":        _alert(pct, False),
-        "_pct":           pct,
-        "_is_cost":       False,
-        "_tag":           "(計算値)",
+        "項目 / Metric": "その他流動資産 / Other Current Assets (=CurrentAssets−Cash)",
+        f"当四半期末 ({cdp_global})\n[USD M]": oca,
+        f"前四半期末 ({pdp_global})\n[USD M]": ocap,
+        "差額 [USD M]": oca_d, "変化率 %": oca_pct,
+        "アラート": _alert(oca_pct, False),
+        "_pct": oca_pct, "_is_cost": False, "_tag": "(計算値)",
     })
     return pd.DataFrame(rows)
 
-def _alert(pct, is_cost_or_liab: bool) -> str:
-    if pct is None:
-        return "—"
-    if is_cost_or_liab:
-        return "⚠️ +20%↑ 急増" if pct > 0.20 else "✅ 正常"
-    return ("⚠️ -20%↓ 急減" if pct < -0.20 else
-            ("✅ +20%↑ 成長" if pct > 0.20 else "✅ 正常"))
+# ─────────────────────────────────────────────────────────────────────────────
+# Pandas Styler
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _style_df(df: pd.DataFrame):
     display_cols = [c for c in df.columns if not c.startswith("_")]
-    display_df = df[display_cols].reset_index(drop=True)
+    display_df   = df[display_cols].reset_index(drop=True)
 
     def highlight_row(row):
         idx     = row.name
         pct     = df.iloc[idx]["_pct"]
         is_cost = df.iloc[idx]["_is_cost"]
-        if pct is None:
+        if pct is None or (isinstance(pct, float) and pd.isna(pct)):
             bg = ""
         else:
-            triggered = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
-            bg = "background-color: #FFD2D2;" if triggered else ""
+            bad = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
+            bg  = "background-color: #FFD2D2;" if bad else ""
         return pd.Series([bg] * len(display_cols), index=display_cols)
 
     def fmt_usd(v):
@@ -348,66 +484,58 @@ def _style_df(df: pd.DataFrame):
             return "N/A"
         return f"{v:+.1%}"
 
-    fmt = {}
-    for c in display_cols:
-        if "USD M" in c or "差額" in c:
-            fmt[c] = fmt_usd
+    fmt       = {c: fmt_usd for c in display_cols if "USD M" in c or "差額" in c}
     fmt["変化率 %"] = fmt_pct
-
     right_cols = [c for c in display_cols if c not in ("項目 / Metric", "アラート")]
 
-    styled = (
-        display_df
-        .style
+    return (
+        display_df.style
         .apply(highlight_row, axis=1)
         .format(fmt, na_rep="N/A")
         .set_properties(**{"text-align": "right"},  subset=right_cols)
         .set_properties(**{"text-align": "left"},   subset=["項目 / Metric"])
         .set_properties(**{"text-align": "center"}, subset=["アラート"])
     )
-    return styled
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Risk Calculations
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_ratios(bs: dict) -> dict:
-    def cur(k): return _m(bs.get(k, {}).get("current", (None,))[0])
-    def pri(k): return _m(bs.get(k, {}).get("prior",   (None,))[0])
+    def cv(k): return _m(bs.get(k, {}).get("current", (None,))[0])
+    def pv(k): return _m(bs.get(k, {}).get("prior",   (None,))[0])
 
-    ca   = cur("CurrentAssets");      ca_p  = pri("CurrentAssets")
-    cl   = cur("CurrentLiabilities"); cl_p  = pri("CurrentLiabilities")
-    cash = cur("Cash");               cash_p= pri("Cash")
-    nca  = cur("NonCurrentAssets")
-    eq   = cur("StockholdersEquity"); eq_p  = pri("StockholdersEquity")
+    ca, ca_p = cv("CurrentAssets"),      pv("CurrentAssets")
+    cl, cl_p = cv("CurrentLiabilities"), pv("CurrentLiabilities")
+    cash, cash_p = cv("Cash"),           pv("Cash")
+    nca  = cv("NonCurrentAssets")
+    eq, eq_p = cv("StockholdersEquity"), pv("StockholdersEquity")
 
-    total  = (ca or 0) + (nca or 0)
-    total_p= (ca_p or 0) + (pri("NonCurrentAssets") or 0)
+    total   = (ca or 0)   + (nca or 0)
+    total_p = (ca_p or 0) + (pv("NonCurrentAssets") or 0)
+
+    def _qoq(cur, pri): return (cur - pri) / abs(pri) if (cur is not None and pri not in (None, 0)) else None
 
     return {
-        "current_ratio":      ca / cl          if (ca and cl and cl != 0) else None,
-        "current_ratio_p":    ca_p / cl_p      if (ca_p and cl_p and cl_p != 0) else None,
-        "equity_ratio":       eq / total        if (eq is not None and total != 0) else None,
-        "equity_ratio_p":     eq_p / total_p   if (eq_p is not None and total_p != 0) else None,
-        "cash_qoq":    (cash - cash_p) / abs(cash_p) if (cash is not None and cash_p not in (None, 0)) else None,
-        "cl_qoq":      (cl - cl_p)     / abs(cl_p)   if (cl   is not None and cl_p   not in (None, 0)) else None,
-        "eq_qoq":      (eq - eq_p)     / abs(eq_p)   if (eq   is not None and eq_p   not in (None, 0)) else None,
+        "current_ratio":   ca / cl       if (ca and cl and cl != 0) else None,
+        "current_ratio_p": ca_p / cl_p   if (ca_p and cl_p and cl_p != 0) else None,
+        "equity_ratio":    eq / total     if (eq is not None and total != 0) else None,
+        "equity_ratio_p":  eq_p / total_p if (eq_p is not None and total_p != 0) else None,
+        "cash_qoq":  _qoq(cash, cash_p),
+        "cl_qoq":    _qoq(cl,   cl_p),
+        "eq_qoq":    _qoq(eq,   eq_p),
         "cash_cur": cash, "cash_pri": cash_p,
         "cl_cur":   cl,   "cl_pri":   cl_p,
         "eq_cur":   eq,   "eq_pri":   eq_p,
     }
 
+
 def risk_verdict(r: dict) -> tuple[str, str, str]:
-    """Returns (verdict_text, verdict_color, emoji)."""
     cash_drop  = r["cash_qoq"] is not None and r["cash_qoq"] < -0.20
     cl_surge   = r["cl_qoq"]   is not None and r["cl_qoq"]   > 0.20
     eq_erosion = r["eq_qoq"]   is not None and r["eq_qoq"]   < -0.20
-
     if cash_drop and (cl_surge or eq_erosion):
-        return (
-            "⚠️ 黒字倒産・資金繰り悪化の予兆あり\nCash shrinking while liabilities surge or equity erodes.",
-            "#FFD2D2", "🔴"
-        )
+        return "⚠️ 黒字倒産・資金繰り悪化の予兆あり\nCash shrinking while liabilities surge or equity erodes.", "#FFD2D2", "🔴"
     n = sum([cash_drop, cl_surge, eq_erosion])
     if n >= 2:
         return "⚡ 要注意：複数の財務悪化シグナルを検知\nMultiple deterioration signals.", "#FFFACD", "🟡"
@@ -418,27 +546,27 @@ def risk_verdict(r: dict) -> tuple[str, str, str]:
     return "✅ 現時点で重大なリスクシグナルなし\nNo major risk signals detected.", "#D2FFD2", "🟢"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Excel Generation (in-memory BytesIO)
+# Excel Builder (3 tabs)
 # ─────────────────────────────────────────────────────────────────────────────
 
-THIN   = Side(style="thin", color="BFBFBF")
-BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+_THIN   = Side(style="thin", color="BFBFBF")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
-RED_F    = PatternFill("solid", fgColor="FFD2D2")
-GREEN_F  = PatternFill("solid", fgColor="D2FFD2")
-YELLOW_F = PatternFill("solid", fgColor="FFFACD")
-BLUE_F   = PatternFill("solid", fgColor="1F4E79")
-SUB_F    = PatternFill("solid", fgColor="2E75B6")
-SEC_F    = PatternFill("solid", fgColor="BDD7EE")
-GREY_F   = PatternFill("solid", fgColor="F2F2F2")
+_RED_F  = PatternFill("solid", fgColor="FFD2D2")
+_GRN_F  = PatternFill("solid", fgColor="D2FFD2")
+_YLW_F  = PatternFill("solid", fgColor="FFFACD")
+_BLU_F  = PatternFill("solid", fgColor="1F4E79")
+_SUB_F  = PatternFill("solid", fgColor="2E75B6")
+_SEC_F  = PatternFill("solid", fgColor="BDD7EE")
+_GRY_F  = PatternFill("solid", fgColor="F2F2F2")
 
-W_BOLD  = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
-D_BOLD  = Font(name="Calibri", bold=True, color="1F4E79", size=11)
-NORM    = Font(name="Calibri", size=10)
-ITALIC  = Font(name="Calibri", size=9, italic=True, color="595959")
-C       = Alignment(horizontal="center", vertical="center", wrap_text=True)
-L       = Alignment(horizontal="left",   vertical="center", wrap_text=True)
-R       = Alignment(horizontal="right",  vertical="center")
+_W_BOLD = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+_D_BOLD = Font(name="Calibri", bold=True, color="1F4E79", size=11)
+_NORM   = Font(name="Calibri", size=10)
+_ITAL   = Font(name="Calibri", size=9,  italic=True, color="595959")
+_C      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+_L      = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+_R      = Alignment(horizontal="right",  vertical="center")
 
 FMT_USD   = '#,##0_);[Red](#,##0)'
 FMT_PCT   = '0.0%;[Red]-0.0%'
@@ -449,54 +577,100 @@ def _cw(ws, widths):
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
+
 def _hrow(ws, row, texts, fill=None):
     for col, t in enumerate(texts, 1):
         c = ws.cell(row=row, column=col, value=t)
-        c.fill = fill or BLUE_F; c.font = W_BOLD
-        c.alignment = C; c.border = BORDER
+        c.fill = fill or _BLU_F
+        c.font = _W_BOLD
+        c.alignment = _C
+        c.border = _BORDER
 
-def _sc(cell, fill=None, font=None, align=None, fmt=None, border=True):
-    if fill:   cell.fill   = fill
-    if font:   cell.font   = font
-    if align:  cell.alignment = align
-    if fmt:    cell.number_format = fmt
-    if border: cell.border = BORDER
+
+def _sc(cell, fill=None, font=None, align=None, fmt=None):
+    if fill:  cell.fill   = fill
+    if font:  cell.font   = font
+    if align: cell.alignment = align
+    if fmt:   cell.number_format = fmt
+    cell.border = _BORDER
+
 
 def _mval(val):
     try:
         return float(val) / 1_000_000 if val is not None else None
-    except:
+    except Exception:
         return None
 
 
-def build_excel(company_name: str, ticker: str, cik: str,
-                pl: dict, bs: dict) -> bytes:
-    wb = Workbook()
-    del wb["Sheet"]
+def _data_row(ws, row_num, label, cur, pri, is_bad_if_high: bool, formula: bool = True):
+    """Write one data row; return whether alert was triggered."""
+    ws.cell(row=row_num, column=1).fill = _GRY_F
+    ws.cell(row=row_num, column=1).border = _BORDER
 
-    # ── Financial Data sheet ───────────────────────────────────────────────
+    lc = ws.cell(row=row_num, column=2, value=label); _sc(lc, font=_NORM, align=_L)
+    cc = ws.cell(row=row_num, column=3, value=cur);   _sc(cc, align=_R, fmt=FMT_USD)
+    dc = ws.cell(row=row_num, column=4, value=pri);   _sc(dc, align=_R, fmt=FMT_USD)
+    if cur  is None: cc.value = "N/A"; cc.font = _ITAL
+    if pri  is None: dc.value = "N/A"; dc.font = _ITAL
+
+    ec = ws.cell(row=row_num, column=5)
+    if cur is not None and pri is not None:
+        ec.value = f"=C{row_num}-D{row_num}"; ec.number_format = FMT_USD
+    else:
+        ec.value = "N/A"; ec.font = _ITAL
+    _sc(ec, align=_R)
+
+    fc = ws.cell(row=row_num, column=6)
+    if cur is not None and pri is not None and pri != 0:
+        fc.value = f"=IF(D{row_num}=0,\"\",(C{row_num}-D{row_num})/D{row_num})"
+        fc.number_format = FMT_PCT
+    else:
+        fc.value = "N/A"; fc.font = _ITAL
+    _sc(fc, align=_C)
+
+    gc = ws.cell(row=row_num, column=7)
+    alert = False
+    if cur is not None and pri is not None and pri != 0:
+        pct = (cur - pri) / abs(pri)
+        if is_bad_if_high and pct > 0.20:
+            gc.value = "⚠️ +20%↑ 急増"; alert = True
+        elif not is_bad_if_high and pct < -0.20:
+            gc.value = "⚠️ -20%↓ 急減"; alert = True
+        else:
+            gc.value = "✅ 正常"
+    else:
+        gc.value = "—"
+    _sc(gc, align=_C)
+
+    if alert:
+        for col in range(2, 8):
+            ws.cell(row=row_num, column=col).fill = _RED_F
+    ws.row_dimensions[row_num].height = 18
+    return alert
+
+
+def _build_fd_sheet(wb, company_name, ticker, cik, pl, bs) -> dict:
     ws = wb.create_sheet("Financial Data")
     ws.views.sheetView[0].showGridLines = True
-    _cw(ws, [3, 38, 18, 18, 18, 13, 16])
+    _cw(ws, [3, 42, 18, 18, 18, 13, 16])
 
     ws.merge_cells("A1:G1")
     t = ws["A1"]
     t.value = f"財務分析レポート | {company_name} ({ticker.upper()}) | Source: SEC EDGAR XBRL"
-    t.fill = BLUE_F; t.font = Font(name="Calibri", bold=True, color="FFFFFF", size=13)
-    t.alignment = C; ws.row_dimensions[1].height = 28
+    t.fill = _BLU_F; t.font = Font(name="Calibri", bold=True, color="FFFFFF", size=13)
+    t.alignment = _C; ws.row_dimensions[1].height = 28
 
     ws.merge_cells("A2:G2")
     s = ws["A2"]
     s.value = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  CIK: {cik}  |  Amounts in USD Millions (M)"
-    s.fill = SUB_F; s.font = Font(name="Calibri", color="FFFFFF", size=9, italic=True)
-    s.alignment = C; ws.row_dimensions[2].height = 14
+    s.fill = _SUB_F; s.font = Font(name="Calibri", color="FFFFFF", size=9, italic=True)
+    s.alignment = _C; ws.row_dimensions[2].height = 14
 
-    # PL section
+    # ── PL section
     row = 4
     ws.merge_cells(f"A{row}:G{row}")
-    c = ws.cell(row=row, column=1, value="📊  損益計算書（P&L） — 前年同期比（YoY）")
-    c.fill = SEC_F; c.font = D_BOLD; c.alignment = L
-    ws.row_dimensions[row].height = 22; row += 1
+    c = ws.cell(row=row, column=1, value="📊  損益計算書（P&L） — 前年同期比（YoY）3ヶ月実績")
+    c.fill = _SEC_F; c.font = _D_BOLD; c.alignment = _L; ws.row_dimensions[row].height = 22; row += 1
 
     pl_cd = pl_pd = "—"
     for d in pl.values():
@@ -504,97 +678,41 @@ def build_excel(company_name: str, ticker: str, cik: str,
     for d in pl.values():
         if d.get("prior"):   pl_pd = d["prior"][1];   break
 
-    _hrow(ws, row, ["", "項目 / Metric",
-                    f"当期\n({pl_cd})\n[USD M]",
-                    f"前期\n({pl_pd})\n[USD M]",
-                    "差額 [USD M]", "変化率 %", "アラート"])
+    _hrow(ws, row, ["", "項目 / Metric", f"当期\n({pl_cd})\n[USD M]",
+                    f"前期\n({pl_pd})\n[USD M]", "差額 [USD M]", "変化率 %", "アラート"])
     ws.row_dimensions[row].height = 40; row += 1
 
     pl_order = [
-        ("Revenues",            "売上高 / Revenues"),
-        ("OperatingExpenses",   "営業費用 / Operating Expenses"),
-        ("OperatingIncomeLoss", "営業利益 / Operating Income"),
-        ("InterestExpense",     "金融損益 / Non-Op. Income/Expense"),
-        ("IncomeLossBeforeTax", "税引前利益 / Income Before Tax"),
-        ("NetIncomeLoss",       "純利益 / Net Income"),
+        ("Revenues",            "売上高 / Revenues",               False),
+        ("OperatingExpenses",   "営業費用 / Operating Expenses",   True),
+        ("OperatingIncomeLoss", "営業利益 / Operating Income",     False),
+        ("InterestExpense",     "金融損益 / Non-Op. Income/Exp.", False),
+        ("IncomeLossBeforeTax", "税引前利益 / Income Before Tax",  False),
+        ("NetIncomeLoss",       "純利益 / Net Income",             False),
     ]
     bs_rows_map = {}
-
-    for key, label in pl_order:
+    for key, label, is_liab in pl_order:
         data = pl.get(key, {})
-        cur = _mval(data["current"][0]) if data.get("current") else None
-        pri = _mval(data["prior"][0])   if data.get("prior")   else None
-        tag = data["current"][2]        if data.get("current") else ""
-        is_cost = key == "OperatingExpenses"
-
-        ws.cell(row=row, column=1).fill = GREY_F
-        _sc(ws.cell(row=row, column=1), border=True)
-
-        lc = ws.cell(row=row, column=2, value=label); _sc(lc, font=NORM, align=L)
-
-        cc = ws.cell(row=row, column=3, value=cur)
-        _sc(cc, align=R, fmt=FMT_USD)
-        if cur is None: cc.value = "N/A"; cc.font = ITALIC
-
-        dc = ws.cell(row=row, column=4, value=pri)
-        _sc(dc, align=R, fmt=FMT_USD)
-        if pri is None: dc.value = "N/A"; dc.font = ITALIC
-
-        ec = ws.cell(row=row, column=5)
-        if cur is not None and pri is not None:
-            ec.value = f"=C{row}-D{row}"; ec.number_format = FMT_USD
-        else:
-            ec.value = "N/A"; ec.font = ITALIC
-        _sc(ec, align=R)
-
-        fc = ws.cell(row=row, column=6)
-        if cur is not None and pri is not None and pri != 0:
-            fc.value = f"=IF(D{row}=0,\"\",(C{row}-D{row})/D{row})"; fc.number_format = FMT_PCT
-        else:
-            fc.value = "N/A"; fc.font = ITALIC
-        _sc(fc, align=C)
-
-        gc = ws.cell(row=row, column=7)
-        alert_hit = False
-        if cur is not None and pri is not None and pri != 0:
-            pct = (cur - pri) / abs(pri)
-            if is_cost and pct > 0.20:
-                gc.value = "⚠️ +20%↑ 急増"; alert_hit = True
-            elif not is_cost and pct < -0.20:
-                gc.value = "⚠️ -20%↓ 急減"; alert_hit = True
-            else:
-                gc.value = "✅ 正常"
-        else:
-            gc.value = "—"
-        _sc(gc, align=C)
-
-        if alert_hit:
-            for col in range(2, 8):
-                ws.cell(row=row, column=col).fill = RED_F
-
-        ws.row_dimensions[row].height = 18
+        cur  = _mval(data["current"][0]) if data.get("current") else None
+        pri  = _mval(data["prior"][0])   if data.get("prior")   else None
+        _data_row(ws, row, label, cur, pri, is_liab)
         row += 1
 
     # Non-GAAP note
-    ws.cell(row=row, column=1).value = "★"
-    ws.cell(row=row, column=1).fill = YELLOW_F
-    _sc(ws.cell(row=row, column=1), align=C)
-    lc = ws.cell(row=row, column=2,
-                 value="在庫影響除き営業利益 / Operating Income ex-Inventory Adj. [Non-GAAP]")
-    lc.font = Font(name="Calibri", size=10, italic=True, color="7F6000")
-    lc.alignment = L; lc.border = BORDER
+    ws.cell(row=row, column=1).value = "★"; ws.cell(row=row, column=1).fill = _YLW_F
+    _sc(ws.cell(row=row, column=1), align=_C)
+    lc = ws.cell(row=row, column=2, value="在庫影響除き営業利益 / Operating Income ex-Inventory Adj. [Non-GAAP]")
+    lc.font = Font(name="Calibri", size=10, italic=True, color="7F6000"); lc.alignment = _L; lc.border = _BORDER
     nc = ws.cell(row=row, column=3,
                  value="※ PARR等エネルギー企業は10-Q MD&Aの「Inventory Valuation Adjustment」を確認し手動で調整してください。")
-    nc.font = Font(name="Calibri", size=8, italic=True, color="7F6000")
-    nc.alignment = L
-    ws.merge_cells(f"C{row}:G{row}"); nc.border = BORDER
+    nc.font = Font(name="Calibri", size=8, italic=True, color="7F6000"); nc.alignment = _L
+    ws.merge_cells(f"C{row}:G{row}"); nc.border = _BORDER
     ws.row_dimensions[row].height = 26; row += 2
 
-    # BS section
+    # ── BS section
     ws.merge_cells(f"A{row}:G{row}")
     c = ws.cell(row=row, column=1, value="🏦  貸借対照表（B/S） — 前四半期比（QoQ）")
-    c.fill = SEC_F; c.font = D_BOLD; c.alignment = L
-    ws.row_dimensions[row].height = 22; row += 1
+    c.fill = _SEC_F; c.font = _D_BOLD; c.alignment = _L; ws.row_dimensions[row].height = 22; row += 1
 
     bs_cd = bs_pd = "—"
     for d in bs.values():
@@ -602,206 +720,136 @@ def build_excel(company_name: str, ticker: str, cik: str,
     for d in bs.values():
         if d.get("prior"):   bs_pd = d["prior"][1];   break
 
-    _hrow(ws, row, ["", "項目 / Metric",
-                    f"当四半期末\n({bs_cd})\n[USD M]",
-                    f"前四半期末\n({bs_pd})\n[USD M]",
-                    "差額 [USD M]", "変化率 %", "アラート"])
+    _hrow(ws, row, ["", "項目 / Metric", f"当四半期末\n({bs_cd})\n[USD M]",
+                    f"前四半期末\n({bs_pd})\n[USD M]", "差額 [USD M]", "変化率 %", "アラート"])
     ws.row_dimensions[row].height = 40; row += 1
 
     bs_order = [
-        ("Cash",               "手元資金 / Cash & Equivalents",    False),
-        ("CurrentLiabilities", "流動負債 / Current Liabilities",   True),
-        ("CurrentAssets",      "流動資産 / Current Assets",        False),
-        ("LongTermLiabilities","長期負債 / LT Liabilities",        True),
-        ("NonCurrentAssets",   "固定資産 / Non-Current Assets",    False),
-        ("StockholdersEquity", "株主資本 / Stockholders' Equity",  False),
+        ("Cash",               "手元資金 / Cash & Equivalents",   False),
+        ("CurrentLiabilities", "流動負債 / Current Liabilities",  True),
+        ("CurrentAssets",      "流動資産 / Current Assets",       False),
+        ("LongTermLiabilities","長期負債 / LT Liabilities",       True),
+        ("NonCurrentAssets",   "固定資産 / Non-Current Assets",   False),
+        ("StockholdersEquity", "株主資本 / Stockholders' Equity", False),
     ]
-
     for key, label, is_liab in bs_order:
         data = bs.get(key, {})
-        cur = _mval(data["current"][0]) if data.get("current") else None
-        pri = _mval(data["prior"][0])   if data.get("prior")   else None
+        cur  = _mval(data["current"][0]) if data.get("current") else None
+        pri  = _mval(data["prior"][0])   if data.get("prior")   else None
         bs_rows_map[key] = row
+        _data_row(ws, row, label, cur, pri, is_liab)
+        row += 1
 
-        ws.cell(row=row, column=1).fill = GREY_F
-        _sc(ws.cell(row=row, column=1))
-
-        lc = ws.cell(row=row, column=2, value=label); _sc(lc, font=NORM, align=L)
-
-        cc = ws.cell(row=row, column=3, value=cur); _sc(cc, align=R, fmt=FMT_USD)
-        if cur is None: cc.value = "N/A"; cc.font = ITALIC
-
-        dc = ws.cell(row=row, column=4, value=pri); _sc(dc, align=R, fmt=FMT_USD)
-        if pri is None: dc.value = "N/A"; dc.font = ITALIC
-
-        ec = ws.cell(row=row, column=5)
-        if cur is not None and pri is not None:
-            ec.value = f"=C{row}-D{row}"; ec.number_format = FMT_USD
-        else:
-            ec.value = "N/A"; ec.font = ITALIC
-        _sc(ec, align=R)
-
-        fc = ws.cell(row=row, column=6)
-        if cur is not None and pri is not None and pri != 0:
-            fc.value = f"=IF(D{row}=0,\"\",(C{row}-D{row})/D{row})"; fc.number_format = FMT_PCT
-        else:
-            fc.value = "N/A"; fc.font = ITALIC
-        _sc(fc, align=C)
-
-        gc = ws.cell(row=row, column=7)
-        alert_hit = False
-        if cur is not None and pri is not None and pri != 0:
-            pct = (cur - pri) / abs(pri)
-            if is_liab and pct > 0.20:
-                gc.value = "⚠️ +20%↑ 急増"; alert_hit = True
-            elif not is_liab and pct < -0.20:
-                gc.value = "⚠️ -20%↓ 急減"; alert_hit = True
-            else:
-                gc.value = "✅ 正常"
-        else:
-            gc.value = "—"
-        _sc(gc, align=C)
-
-        if alert_hit:
-            for col in range(2, 8):
-                ws.cell(row=row, column=col).fill = RED_F
-
-        ws.row_dimensions[row].height = 18; row += 1
-
-    # Other Current Assets (formula-derived)
-    cash_r = bs_rows_map.get("Cash")
-    ca_r   = bs_rows_map.get("CurrentAssets")
-    ws.cell(row=row, column=1).fill = GREY_F; _sc(ws.cell(row=row, column=1))
+    # Other Current Assets
+    cash_r = bs_rows_map.get("Cash"); ca_r = bs_rows_map.get("CurrentAssets")
+    ws.cell(row=row, column=1).fill = _GRY_F; _sc(ws.cell(row=row, column=1))
     lc = ws.cell(row=row, column=2, value="その他流動資産 / Other Current Assets (=CurrentAssets−Cash)")
-    lc.font = Font(name="Calibri", size=10, italic=True); lc.alignment = L; lc.border = BORDER
+    lc.font = Font(name="Calibri", size=10, italic=True); lc.alignment = _L; lc.border = _BORDER
     if cash_r and ca_r:
-        for col, (c_ref, d_ref) in enumerate([(f"C{ca_r}-C{cash_r}", f"D{ca_r}-D{cash_r}"),], 3):
-            oc = ws.cell(row=row, column=col, value=f"={c_ref}")
-            oc.number_format = FMT_USD; _sc(oc, align=R)
-            od = ws.cell(row=row, column=col+1, value=f"={d_ref}")
-            od.number_format = FMT_USD; _sc(od, align=R)
-            oe = ws.cell(row=row, column=5, value=f"=C{row}-D{row}")
-            oe.number_format = FMT_USD; _sc(oe, align=R)
-            of_ = ws.cell(row=row, column=6, value=f"=IF(D{row}=0,\"\",(C{row}-D{row})/D{row})")
-            of_.number_format = FMT_PCT; _sc(of_, align=C)
+        for col_idx, formula in [(3, f"=C{ca_r}-C{cash_r}"), (4, f"=D{ca_r}-D{cash_r}")]:
+            c2 = ws.cell(row=row, column=col_idx, value=formula); c2.number_format = FMT_USD; _sc(c2, align=_R)
+        e2 = ws.cell(row=row, column=5, value=f"=C{row}-D{row}"); e2.number_format = FMT_USD; _sc(e2, align=_R)
+        f2 = ws.cell(row=row, column=6, value=f"=IF(D{row}=0,\"\",(C{row}-D{row})/D{row})"); f2.number_format = FMT_PCT; _sc(f2, align=_C)
     else:
         for col in range(3, 8):
-            c = ws.cell(row=row, column=col, value="N/A"); c.font = ITALIC; c.border = BORDER
-    ws.cell(row=row, column=7, value="(計算値)").border = BORDER
+            c2 = ws.cell(row=row, column=col, value="N/A"); c2.font = _ITAL; c2.border = _BORDER
+    ws.cell(row=row, column=7, value="(計算値)").border = _BORDER
     ws.row_dimensions[row].height = 18; row += 2
 
-    # Legend
     ws.merge_cells(f"A{row}:G{row}")
     leg = ws.cell(row=row, column=1,
                   value="[凡例] ⚠️=アラート(20%以上悪化) ✅=正常 N/A=データ未取得 ★=Non-GAAP(要手動確認) | 金額はUSD百万単位")
-    leg.font = ITALIC; leg.fill = GREY_F; leg.alignment = L
-    ws.row_dimensions[row].height = 14
+    leg.font = _ITAL; leg.fill = _GRY_F; leg.alignment = _L; ws.row_dimensions[row].height = 14
 
-    # ── Dashboard sheet ────────────────────────────────────────────────────
+    return bs_rows_map
+
+
+def _build_dashboard_sheet(wb, company_name, ticker, cik, pl, bs, bs_rows_map):
     wd = wb.create_sheet("Dashboard", 0)
     wd.views.sheetView[0].showGridLines = True
-    _cw(wd, [3, 30, 22, 22, 16, 14, 3])
+    _cw(wd, [3, 32, 22, 22, 16, 14, 3])
 
     wd.merge_cells("A1:G1")
     t = wd["A1"]
     t.value = f"財務ヘルスダッシュボード | {company_name} ({ticker.upper()})"
-    t.fill = BLUE_F; t.font = Font(name="Calibri", bold=True, color="FFFFFF", size=15)
-    t.alignment = C; wd.row_dimensions[1].height = 34
+    t.fill = _BLU_F; t.font = Font(name="Calibri", bold=True, color="FFFFFF", size=15)
+    t.alignment = _C; wd.row_dimensions[1].height = 34
 
     wd.merge_cells("A2:G2")
     s = wd["A2"]
     s.value = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  CIK: {cik}  |  Source: SEC EDGAR XBRL"
-    s.fill = SUB_F; s.font = Font(name="Calibri", color="FFFFFF", size=9, italic=True)
-    s.alignment = C; wd.row_dimensions[2].height = 14
+    s.fill = _SUB_F; s.font = Font(name="Calibri", color="FFFFFF", size=9, italic=True)
+    s.alignment = _C; wd.row_dimensions[2].height = 14
 
-    # Key Ratios (cross-sheet formulas)
     dr = 4
     wd.merge_cells(f"A{dr}:G{dr}")
     c = wd.cell(row=dr, column=1, value="📐  主要財務比率（Financial Dataシートと数式連携）")
-    c.fill = SEC_F; c.font = D_BOLD; c.alignment = L; wd.row_dimensions[dr].height = 22; dr += 1
-
+    c.fill = _SEC_F; c.font = _D_BOLD; c.alignment = _L; wd.row_dimensions[dr].height = 22; dr += 1
     _hrow(wd, dr, ["", "指標 / Ratio", "当期", "前期", "変化", "判定", ""]); wd.row_dimensions[dr].height = 22; dr += 1
 
     fd = "'Financial Data'"
-    ca_r2 = bs_rows_map.get("CurrentAssets")
-    cl_r2 = bs_rows_map.get("CurrentLiabilities")
-    eq_r2 = bs_rows_map.get("StockholdersEquity")
-    nca_r2= bs_rows_map.get("NonCurrentAssets")
+    ca_r = bs_rows_map.get("CurrentAssets"); cl_r = bs_rows_map.get("CurrentLiabilities")
+    eq_r = bs_rows_map.get("StockholdersEquity"); nca_r = bs_rows_map.get("NonCurrentAssets")
 
-    def _ratio_row(wd, dr, label, cur_f, pri_f, fmt, status_f, status_fill):
-        wd.cell(row=dr, column=1).border = BORDER
-        lc = wd.cell(row=dr, column=2, value=label); _sc(lc, font=NORM, align=L)
-        cc = wd.cell(row=dr, column=3, value=cur_f); cc.number_format = fmt; _sc(cc, align=R)
-        dc = wd.cell(row=dr, column=4, value=pri_f); dc.number_format = fmt; _sc(dc, align=R)
-        ec = wd.cell(row=dr, column=5, value=f"=C{dr}-D{dr}"); ec.number_format = fmt; _sc(ec, align=R)
-        sc = wd.cell(row=dr, column=6, value=status_f)
-        _sc(sc, fill=status_fill, align=C)
-        wd.cell(row=dr, column=7).border = BORDER
-        wd.row_dimensions[dr].height = 18
+    def _ratio_row(label, cur_f, pri_f, fmt, status_f, sfill):
+        nonlocal dr
+        wd.cell(row=dr, column=1).border = _BORDER
+        lc = wd.cell(row=dr, column=2, value=label); _sc(lc, font=_NORM, align=_L)
+        cc = wd.cell(row=dr, column=3, value=cur_f); cc.number_format = fmt; _sc(cc, align=_R)
+        dc = wd.cell(row=dr, column=4, value=pri_f); dc.number_format = fmt; _sc(dc, align=_R)
+        ec = wd.cell(row=dr, column=5, value=f"=C{dr}-D{dr}"); ec.number_format = fmt; _sc(ec, align=_R)
+        sc = wd.cell(row=dr, column=6, value=status_f); _sc(sc, fill=sfill, align=_C)
+        wd.cell(row=dr, column=7).border = _BORDER; wd.row_dimensions[dr].height = 18; dr += 1
 
     ratios = compute_ratios(bs)
+    cr_v = ratios["current_ratio"]; er_v = ratios["equity_ratio"]
+    cr_fill = _RED_F if (cr_v and cr_v < 1) else (_YLW_F if (cr_v and cr_v < 1.5) else _GRN_F)
+    er_fill = _RED_F if (er_v is not None and er_v < 0.1) else (_YLW_F if (er_v is not None and er_v < 0.3) else _GRN_F)
 
-    # Current Ratio
-    if ca_r2 and cl_r2:
-        cur_f = f"={fd}!C{ca_r2}/{fd}!C{cl_r2}"
-        pri_f = f"={fd}!D{ca_r2}/{fd}!D{cl_r2}"
-        sf    = f'=IF(C{dr}<1,"⚠️ <1.0 危険",IF(C{dr}<1.5,"⚡ 注意","✅ 良好"))'
-        cr_v  = ratios["current_ratio"]
-        sfill = RED_F if (cr_v and cr_v < 1) else (YELLOW_F if (cr_v and cr_v < 1.5) else GREEN_F)
-    else:
-        cur_f = pri_f = sf = "N/A"; sfill = GREY_F
-    _ratio_row(wd, dr, "流動比率 / Current Ratio", cur_f, pri_f, FMT_RATIO, sf, sfill); dr += 1
+    if ca_r and cl_r:
+        _ratio_row("流動比率 / Current Ratio",
+                   f"={fd}!C{ca_r}/{fd}!C{cl_r}", f"={fd}!D{ca_r}/{fd}!D{cl_r}", FMT_RATIO,
+                   f'=IF(C{dr-1}<1,"⚠️ <1.0 危険",IF(C{dr-1}<1.5,"⚡ 注意","✅ 良好"))', cr_fill)
+    if ca_r and nca_r and eq_r:
+        ta_c = f"({fd}!C{ca_r}+{fd}!C{nca_r})"; ta_p = f"({fd}!D{ca_r}+{fd}!D{nca_r})"
+        _ratio_row("自己資本比率 / Equity Ratio",
+                   f"={fd}!C{eq_r}/{ta_c}", f"={fd}!D{eq_r}/{ta_p}", FMT_PCT,
+                   f'=IF(C{dr-1}<0.1,"⚠️ <10% 危険",IF(C{dr-1}<0.3,"⚡ <30% 低水準","✅ 良好"))', er_fill)
 
-    # Equity Ratio
-    if ca_r2 and nca_r2 and eq_r2:
-        ta_c  = f"({fd}!C{ca_r2}+{fd}!C{nca_r2})"
-        ta_p  = f"({fd}!D{ca_r2}+{fd}!D{nca_r2})"
-        cur_f = f"={fd}!C{eq_r2}/{ta_c}"
-        pri_f = f"={fd}!D{eq_r2}/{ta_p}"
-        sf    = f'=IF(C{dr}<0.1,"⚠️ <10% 危険",IF(C{dr}<0.3,"⚡ <30% 低水準","✅ 良好"))'
-        er_v  = ratios["equity_ratio"]
-        sfill = RED_F if (er_v is not None and er_v < 0.1) else (YELLOW_F if (er_v is not None and er_v < 0.3) else GREEN_F)
-    else:
-        cur_f = pri_f = sf = "N/A"; sfill = GREY_F
-    _ratio_row(wd, dr, "自己資本比率 / Equity Ratio", cur_f, pri_f, FMT_PCT, sf, sfill); dr += 2
-
-    # Risk Alert Section
+    dr += 1
     wd.merge_cells(f"A{dr}:G{dr}")
     c = wd.cell(row=dr, column=1, value="🚨  倒産予兆・資金繰りリスク判定")
     c.fill = PatternFill("solid", fgColor="C00000")
     c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=12)
-    c.alignment = L; wd.row_dimensions[dr].height = 26; dr += 1
-
+    c.alignment = _L; wd.row_dimensions[dr].height = 26; dr += 1
     _hrow(wd, dr, ["", "チェック項目", "実績値", "判定基準", "状態", "", ""]); wd.row_dimensions[dr].height = 20; dr += 1
 
-    def _risk_row(wd, dr, label, result, threshold, is_bad):
-        wd.cell(row=dr, column=1).border = BORDER
-        lc = wd.cell(row=dr, column=2, value=label); _sc(lc, font=NORM, align=L)
-        rc = wd.cell(row=dr, column=3, value=result); _sc(rc, font=NORM, align=C)
-        tc = wd.cell(row=dr, column=4, value=threshold); _sc(tc, font=ITALIC, align=C)
-        status = "⚠️ 要注意" if is_bad else "✅ 正常"
-        sc = wd.cell(row=dr, column=5, value=status)
-        _sc(sc, fill=(RED_F if is_bad else GREEN_F), align=C)
-        for col in [6, 7]: wd.cell(row=dr, column=col).border = BORDER
-        wd.row_dimensions[dr].height = 18
-
     r = ratios
-    cash_bad = r["cash_qoq"] is not None and r["cash_qoq"] < -0.20
-    cl_bad   = r["cl_qoq"]   is not None and r["cl_qoq"]   > 0.20
-    eq_bad   = r["eq_qoq"]   is not None and r["eq_qoq"]   < -0.20
+    def _risk_row(label, pct, cur_v, pri_v, threshold, bad_cond):
+        nonlocal dr
+        is_bad = bad_cond(pct) if pct is not None else False
+        wd.cell(row=dr, column=1).border = _BORDER
+        lc = wd.cell(row=dr, column=2, value=label); _sc(lc, font=_NORM, align=_L)
+        if pct is not None and cur_v is not None and pri_v is not None:
+            result = f"{pct:+.1%}  ({pri_v:,.0f}M → {cur_v:,.0f}M)"
+        else:
+            result = "N/A"
+        rc = wd.cell(row=dr, column=3, value=result); _sc(rc, font=_NORM, align=_C)
+        tc = wd.cell(row=dr, column=4, value=threshold); _sc(tc, font=_ITAL, align=_C)
+        sc = wd.cell(row=dr, column=5, value="⚠️ 要注意" if is_bad else "✅ 正常")
+        _sc(sc, fill=(_RED_F if is_bad else _GRN_F), align=_C)
+        for col in [6, 7]: wd.cell(row=dr, column=col).border = _BORDER
+        wd.row_dimensions[dr].height = 18; dr += 1
 
-    def _fmt_qoq(pct, cur, pri):
-        if pct is None: return "N/A"
-        return f"{pct:+.1%}  ({pri:,.0f}M → {cur:,.0f}M)" if (cur is not None and pri is not None) else f"{pct:+.1%}"
+    _risk_row("手元資金 QoQ変化", r["cash_qoq"], r["cash_cur"], r["cash_pri"], "< -20% で警告", lambda p: p < -0.20)
+    _risk_row("流動負債 QoQ変化", r["cl_qoq"],   r["cl_cur"],   r["cl_pri"],   "> +20% で警告", lambda p: p > 0.20)
+    _risk_row("株主資本 QoQ変化", r["eq_qoq"],   r["eq_cur"],   r["eq_pri"],   "< -20% で警告", lambda p: p < -0.20)
 
-    _risk_row(wd, dr, "手元資金 QoQ変化 (Cash)", _fmt_qoq(r["cash_qoq"], r["cash_cur"], r["cash_pri"]), "< -20% で警告", cash_bad); dr += 1
-    _risk_row(wd, dr, "流動負債 QoQ変化 (Current Liabilities)", _fmt_qoq(r["cl_qoq"], r["cl_cur"], r["cl_pri"]), "> +20% で警告", cl_bad); dr += 1
-    _risk_row(wd, dr, "株主資本 QoQ変化 (Stockholders' Equity)", _fmt_qoq(r["eq_qoq"], r["eq_cur"], r["eq_pri"]), "< -20% で警告", eq_bad); dr += 2
-
-    # Verdict
+    dr += 1
     wd.merge_cells(f"A{dr}:G{dr}")
-    vt = wd.cell(row=dr, column=1, value="総合リスク判定 / Overall Risk Verdict")
-    vt.fill = SUB_F; vt.font = W_BOLD; vt.alignment = C; wd.row_dimensions[dr].height = 22; dr += 1
+    wd.cell(row=dr, column=1, value="総合リスク判定 / Overall Risk Verdict").fill = _SUB_F
+    wd.cell(row=dr, column=1).font = _W_BOLD; wd.cell(row=dr, column=1).alignment = _C
+    wd.row_dimensions[dr].height = 22; dr += 1
 
     verdict_txt, verdict_hex, _ = risk_verdict(r)
     wd.merge_cells(f"A{dr}:G{dr}")
@@ -816,85 +864,55 @@ def build_excel(company_name: str, ticker: str, cik: str,
     wd.merge_cells(f"A{dr}:G{dr}")
     dis = wd.cell(row=dr, column=1,
                   value="※ 免責：本ツールはSEC EDGAR公開データに基づく自動分析です。投資判断は必ず一次情報（10-Q/10-K）と専門家意見でご確認ください。")
-    dis.font = ITALIC; dis.fill = GREY_F; dis.alignment = L; wd.row_dimensions[dr].height = 14
+    dis.font = _ITAL; dis.fill = _GRY_F; dis.alignment = _L; wd.row_dimensions[dr].height = 14
 
+
+def _build_mda_sheet(wb, mda_text: str, company_name: str, period: str):
+    wm = wb.create_sheet("MD&A_Text")
+    wm.views.sheetView[0].showGridLines = True
+    wm.column_dimensions["A"].width = 4
+    wm.column_dimensions["B"].width = 120
+
+    wm.merge_cells("A1:B1")
+    t = wm["A1"]
+    t.value = f"Management's Discussion and Analysis (MD&A)  |  {company_name}  |  Period: {period}"
+    t.fill = _BLU_F; t.font = Font(name="Calibri", bold=True, color="FFFFFF", size=13)
+    t.alignment = _C; wm.row_dimensions[1].height = 28
+
+    wm.merge_cells("A2:B2")
+    s = wm["A2"]
+    s.value = "※ 以下のテキストをClaude/ChatGPT等のAIにそのままコピー&ペーストしてMD&Aの要約・分析を依頼できます。"
+    s.fill = _YLW_F; s.font = Font(name="Calibri", size=10, italic=True, color="7F6000"); s.alignment = _L
+    wm.row_dimensions[2].height = 18
+
+    # Split text into chunks of 30000 chars (Excel cell limit is 32767)
+    CHUNK = 30000
+    chunks = [mda_text[i:i+CHUNK] for i in range(0, len(mda_text), CHUNK)] if mda_text else ["（テキストなし）"]
+    for idx, chunk in enumerate(chunks, start=3):
+        wm.merge_cells(f"A{idx}:B{idx}")
+        c = wm.cell(row=idx, column=1, value=chunk)
+        c.font = Font(name="Calibri", size=10)
+        c.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        c.border = _BORDER
+        wm.row_dimensions[idx].height = max(60, min(400, len(chunk) // 80 * 15))
+
+
+def build_excel(company_name: str, ticker: str, cik: str,
+                pl: dict, bs: dict, mda_text: str, period: str) -> bytes:
+    wb = Workbook()
+    del wb["Sheet"]
+    bs_rows_map = _build_fd_sheet(wb, company_name, ticker, cik, pl, bs)
+    _build_dashboard_sheet(wb, company_name, ticker, cik, pl, bs, bs_rows_map)
+    _build_mda_sheet(wb, mda_text, company_name, period)
+    wb.move_sheet("Dashboard", offset=-len(wb.sheetnames) + 1)
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.getvalue()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Streamlit UI
+# Demo Data
 # ─────────────────────────────────────────────────────────────────────────────
-
-st.set_page_config(
-    page_title="SEC財務分析ツール",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
-
-st.markdown("""
-<style>
-/* Global */
-[data-testid="stAppViewContainer"] { background: #F7F9FC; }
-h1 { color: #1F4E79; }
-h2 { color: #2E75B6; font-size:1.15rem; margin-top:1.2rem; margin-bottom:0.3rem; }
-/* Metric cards */
-[data-testid="metric-container"] {
-    background: #fff; border-radius: 10px;
-    border: 1px solid #D0E4F4; padding: 10px 14px;
-    box-shadow: 0 1px 4px rgba(0,0,0,.07);
-}
-/* Alert box */
-.alert-box {
-    padding: 14px 18px; border-radius: 10px;
-    font-size: 1.05rem; font-weight: 600;
-    margin-bottom: 10px;
-}
-.alert-red    { background:#FFD2D2; color:#8B0000; border-left:5px solid #C00000; }
-.alert-yellow { background:#FFFACD; color:#7F6000; border-left:5px solid #FFC000; }
-.alert-green  { background:#D2FFD2; color:#1E6B2E; border-left:5px solid #00B050; }
-.alert-grey   { background:#F2F2F2; color:#595959; border-left:5px solid #BFBFBF; }
-/* Download btn */
-[data-testid="stDownloadButton"] button {
-    background: #1F4E79 !important; color: #fff !important;
-    font-weight: 700 !important; border-radius: 8px !important;
-    padding: 10px 24px !important; font-size: 1rem !important;
-    border: none !important;
-}
-[data-testid="stDownloadButton"] button:hover {
-    background: #2E75B6 !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# Header
-st.markdown("# 📊 SEC EDGAR 財務分析ツール")
-st.markdown("米国上場企業のティッカーを入力すると、最新の財務データ（10-Q/10-K）を自動取得して分析します。")
-st.markdown("---")
-
-# Input
-col_in, col_btn, col_demo = st.columns([3, 1.2, 1.2])
-with col_in:
-    ticker_input = st.text_input(
-        "ティッカーシンボル（例: PARR, XOM, TSLA）",
-        value="PARR",
-        max_chars=10,
-        placeholder="PARR",
-        label_visibility="visible",
-    )
-with col_btn:
-    st.markdown("<br>", unsafe_allow_html=True)
-    run_btn = st.button("🔍 分析実行", type="primary", use_container_width=True)
-with col_demo:
-    st.markdown("<br>", unsafe_allow_html=True)
-    demo_btn = st.button("🧪 デモデータ", use_container_width=True,
-                         help="ネットワーク不要のサンプルデータで動作確認")
-
-st.markdown("---")
-
-# ── Demo data builder ──────────────────────────────────────────────────────
 
 def demo_pl_bs():
     pl = {
@@ -927,151 +945,260 @@ def demo_pl_bs():
     }
     return pl, bs
 
-# ── Render results ──────────────────────────────────────────────────────────
+DEMO_MDA = """\
+ITEM 2. MANAGEMENT'S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS
 
-def render(company_name: str, ticker: str, cik: str, pl: dict, bs: dict):
-    ratios  = compute_ratios(bs)
-    verdict, v_hex, v_emoji = risk_verdict(ratios)
+Overview
 
-    # Verdict banner
-    cls = ("alert-red"    if "FFD2D2" in v_hex else
-           "alert-yellow" if "FACD"   in v_hex else
-           "alert-grey"   if "F2F2F" in v_hex else "alert-green")
-    st.markdown(f'<div class="alert-box {cls}">{v_emoji} {verdict.replace(chr(10), "  |  ")}</div>',
-                unsafe_allow_html=True)
+The following discussion and analysis should be read in conjunction with our unaudited condensed consolidated financial statements and the related notes included elsewhere in this Quarterly Report on Form 10-Q.
 
-    # Company + ratio KPIs
-    st.markdown(f"### 🏢 {company_name}  `{ticker.upper()}`  —  CIK: `{cik}`")
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+We are an independent energy company focused on acquiring and developing value-added downstream energy businesses. Our primary operations consist of refining and distribution of petroleum products, retail fuel sales, and logistics operations.
 
-    def _pct_str(v):  return f"{v:.1%}"  if v is not None else "N/A"
-    def _ratio_str(v): return f"{v:.2f}" if v is not None else "N/A"
-    def _m_str(v):    return f"${v:,.0f}M" if v is not None else "N/A"
+Results of Operations — Three Months Ended September 30, 2024
 
-    cr  = ratios["current_ratio"]
-    er  = ratios["equity_ratio"]
-    k1.metric("流動比率", _ratio_str(cr),
-              delta=f"{ratios['current_ratio']-ratios['current_ratio_p']:.2f}" if (cr and ratios["current_ratio_p"]) else None)
-    k2.metric("自己資本比率", _pct_str(er),
-              delta=f"{(ratios['equity_ratio']-ratios['equity_ratio_p']):.1%}" if (er and ratios["equity_ratio_p"]) else None)
-    k3.metric("手元資金 QoQ", _pct_str(ratios["cash_qoq"]),
-              delta=None, delta_color="inverse")
-    k4.metric("流動負債 QoQ", _pct_str(ratios["cl_qoq"]))
-    k5.metric("株主資本 QoQ", _pct_str(ratios["eq_qoq"]),
-              delta=None, delta_color="inverse")
-    k6.metric("現金残高", _m_str(ratios["cash_cur"]))
+Revenues decreased $300.0 million, or 12.2%, to $2,150.0 million for the three months ended September 30, 2024, compared to $2,450.0 million for the same period in 2023. The decrease was primarily attributable to lower refined product prices driven by declining crude oil markets and tightened crack spreads across our refining segments.
 
-    st.markdown("---")
+Operating expenses of $2,050.0 million for the three months ended September 30, 2024 decreased by $150.0 million compared to the prior year period, driven by lower feedstock costs partially offsetting volume declines.
 
-    # ── PL Table ──
-    st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
-    st.caption("差額・変化率の列はExcelダウンロード版では数式として埋め込まれます。")
-    pl_df = build_pl_df(pl)
-    st.dataframe(
-        _style_df(pl_df),
-        use_container_width=True,
-        height=280,
-    )
+Operating income of $100.0 million decreased by $150.0 million, or 60.0%, compared to operating income of $250.0 million in the prior year period. The decrease reflects the impact of inventory valuation adjustments of approximately $(85) million related to lower crude oil prices during the quarter. Excluding inventory valuation adjustments, adjusted operating income would have been approximately $185 million.
 
-    # Non-GAAP note
-    st.info("★ **在庫影響除き営業利益（Non-GAAP）** — PARR等エネルギー企業では10-Q MD&Aの「Inventory Valuation Adjustment」を確認し手動で調整してください。", icon="ℹ️")
+Liquidity and Capital Resources
 
-    # ── BS Table ──
-    st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-    bs_df = build_bs_df(bs)
-    st.dataframe(
-        _style_df(bs_df),
-        use_container_width=True,
-        height=320,
-    )
+Cash and cash equivalents decreased by $140.0 million to $180.0 million as of September 30, 2024, from $320.0 million as of June 30, 2024, primarily due to debt repayments and capital expenditures. We had $950.0 million in current liabilities as of September 30, 2024.
 
-    st.markdown("---")
+[DEMO DATA — このテキストはデモ用サンプルです。実際のSEC取得時は英文の10-Q/10-K MD&Aテキストがここに表示されます。]
+"""
 
-    # ── Risk detail ──
-    st.markdown("## 🚨 リスク指標詳細")
-    rc1, rc2, rc3 = st.columns(3)
-    def _risk_card(col, label, pct, cur_val, pri_val, warn_cond):
-        is_bad = warn_cond(pct) if pct is not None else False
-        bg = "#FFD2D2" if is_bad else "#D2FFD2"
-        icon = "⚠️" if is_bad else "✅"
-        txt = f"{pct:+.1%}" if pct is not None else "N/A"
-        detail = f"{pri_val:,.0f}M → {cur_val:,.0f}M" if (cur_val is not None and pri_val is not None) else ""
-        col.markdown(f"""
-        <div style="background:{bg};border-radius:10px;padding:14px 16px;border:1px solid #ccc;">
-        <div style="font-weight:700;font-size:.95rem;">{icon} {label}</div>
-        <div style="font-size:1.6rem;font-weight:800;margin:4px 0;">{txt}</div>
-        <div style="font-size:.8rem;color:#555;">{detail}</div>
-        </div>""", unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ─────────────────────────────────────────────────────────────────────────────
 
-    _risk_card(rc1, "手元資金 QoQ", ratios["cash_qoq"], ratios["cash_cur"], ratios["cash_pri"],
-               lambda p: p < -0.20)
-    _risk_card(rc2, "流動負債 QoQ", ratios["cl_qoq"],   ratios["cl_cur"],   ratios["cl_pri"],
-               lambda p: p > 0.20)
-    _risk_card(rc3, "株主資本 QoQ", ratios["eq_qoq"],   ratios["eq_cur"],   ratios["eq_pri"],
-               lambda p: p < -0.20)
+st.set_page_config(
+    page_title="SEC財務分析ツール",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-    st.markdown("---")
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"] { background: #F7F9FC; }
+h1 { color: #1F4E79; }
+h2 { color: #2E75B6; font-size:1.1rem; margin-top:1.2rem; margin-bottom:0.3rem; }
+[data-testid="metric-container"] {
+    background:#fff; border-radius:10px;
+    border:1px solid #D0E4F4; padding:10px 14px;
+    box-shadow:0 1px 4px rgba(0,0,0,.07);
+}
+.alert-box { padding:14px 18px; border-radius:10px; font-size:1.05rem;
+             font-weight:600; margin-bottom:10px; }
+.alert-red    { background:#FFD2D2; color:#8B0000; border-left:5px solid #C00000; }
+.alert-yellow { background:#FFFACD; color:#7F6000; border-left:5px solid #FFC000; }
+.alert-green  { background:#D2FFD2; color:#1E6B2E; border-left:5px solid #00B050; }
+.alert-grey   { background:#F2F2F2; color:#595959; border-left:5px solid #BFBFBF; }
+[data-testid="stDownloadButton"] button {
+    background:#1F4E79 !important; color:#fff !important;
+    font-weight:700 !important; border-radius:8px !important;
+    padding:10px 24px !important; font-size:1rem !important; border:none !important;
+}
+[data-testid="stDownloadButton"] button:hover { background:#2E75B6 !important; }
+</style>
+""", unsafe_allow_html=True)
 
-    # ── Excel download ──
-    st.markdown("## 📥 Excelレポートのダウンロード")
-    st.markdown("数式連携・カラーハイライト付きの **.xlsx** ファイルをダウンロードできます。")
-    with st.spinner("Excelファイルを生成中…"):
-        excel_bytes = build_excel(company_name, ticker, cik, pl, bs)
-    filename = f"{ticker.upper()}_financial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    st.download_button(
-        label="📥 このレポートをExcelでダウンロード",
-        data=excel_bytes,
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    st.caption(f"ファイル名: `{filename}`  |  シート構成: Dashboard / Financial Data")
+# Session state init
+for k in ("filings", "last_ticker", "cik", "company_name", "facts"):
+    if k not in st.session_state:
+        st.session_state[k] = None
 
+st.markdown("# 📊 SEC EDGAR 財務分析ツール")
+st.markdown("米国上場企業のティッカーと対象決算期を選択して「財務分析を実行」してください。")
+st.markdown("---")
 
-# ── Main execution logic ───────────────────────────────────────────────────
+# ── Step 1: Ticker + period fetch ──────────────────────────────────────────
+col_t, col_f, col_d = st.columns([3, 1.4, 1.4])
+with col_t:
+    ticker_input = st.text_input("ティッカーシンボル（例: PARR, XOM, TSLA）",
+                                 value="PARR", max_chars=10)
+with col_f:
+    st.markdown("<br>", unsafe_allow_html=True)
+    fetch_btn = st.button("📋 決算期リストを取得", use_container_width=True)
+with col_d:
+    st.markdown("<br>", unsafe_allow_html=True)
+    demo_btn = st.button("🧪 デモデータ", use_container_width=True,
+                         help="ネットワーク不要のサンプルデータで動作確認")
 
-if demo_btn:
-    pl, bs = demo_pl_bs()
-    render("PARR Inc. [DEMO DATA]", "PARR", KNOWN_CIKS["PARR"], pl, bs)
-
-elif run_btn:
+if fetch_btn:
     ticker = ticker_input.strip().upper()
-    if not ticker:
-        st.warning("ティッカーを入力してください。")
-        st.stop()
-
-    with st.spinner(f"SEC EDGAR から {ticker} のデータを取得中…"):
+    with st.spinner(f"{ticker} のCIKと決算期リストを取得中…"):
         cik, company_name = resolve_cik(ticker)
         if cik is None:
-            st.error(f"ティッカー `{ticker}` のCIKが見つかりませんでした。\n"
-                     "スペルを確認するか、`--demo` ボタンで動作確認してください。")
-            st.stop()
+            st.error(f"ティッカー `{ticker}` が見つかりません。スペルを確認してください。")
+        else:
+            filings = get_filings_list(cik)
+            if not filings:
+                st.warning("決算期リストを取得できませんでした。ネットワーク環境を確認してください。")
+            else:
+                st.session_state.filings      = filings
+                st.session_state.last_ticker  = ticker
+                st.session_state.cik          = cik
+                st.session_state.company_name = company_name
+                st.session_state.facts        = None
+                st.success(f"✅ {company_name} — {len(filings)} 件の決算期を取得しました。")
 
-        facts = fetch_facts(cik)
-        if not facts:
-            st.error("SEC EDGAR からデータを取得できませんでした。\n"
-                     "ネットワーク環境を確認するか、しばらく時間をおいて再試行してください。")
-            st.stop()
+st.markdown("---")
 
-        if not company_name or company_name == ticker:
-            company_name = facts.get("entityName", ticker)
+# ── Step 2: Period selection + Analysis ────────────────────────────────────
+if demo_btn:
+    # --- Demo mode ---
+    pl, bs = demo_pl_bs()
+    ratios = compute_ratios(bs)
+    verdict, v_hex, v_emoji = risk_verdict(ratios)
+    mda_text  = DEMO_MDA
+    company_name = "PARR Inc. [DEMO DATA]"
+    ticker    = "PARR"
+    cik       = KNOWN_CIKS["PARR"]
+    period    = "2024-09-30"
 
-        pl = extract_pl(facts)
-        bs = extract_bs(facts)
+    cls = ("alert-red" if "FFD2D2" in v_hex else
+           "alert-yellow" if "FACD" in v_hex else
+           "alert-grey" if "F2F2" in v_hex else "alert-green")
+    st.markdown(f'<div class="alert-box {cls}">{v_emoji} {verdict.replace(chr(10),"  |  ")}</div>',
+                unsafe_allow_html=True)
+    st.markdown(f"### 🏢 {company_name}  `{ticker}`  —  期間: `{period}`")
 
-    render(company_name, ticker, cik, pl, bs)
+    k1,k2,k3,k4,k5,k6 = st.columns(6)
+    def _ps(v): return f"{v:.1%}" if v is not None else "N/A"
+    def _rs(v): return f"{v:.2f}" if v is not None else "N/A"
+    def _ms(v): return f"${v:,.0f}M" if v is not None else "N/A"
+    k1.metric("流動比率", _rs(ratios["current_ratio"]))
+    k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
+    k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
+    k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
+    k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
+    k6.metric("現金残高", _ms(ratios["cash_cur"]))
+    st.markdown("---")
+
+    st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）")
+    st.dataframe(_style_df(build_pl_df(pl)), use_container_width=True, height=270)
+    st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
+
+    st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
+    st.dataframe(_style_df(build_bs_df(bs)), use_container_width=True, height=310)
+
+    st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
+    st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
+    st.text_area("MD&A テキスト", value=mda_text, height=400, label_visibility="collapsed")
+    st.markdown("---")
+
+    st.markdown("## 📥 分析結果をExcelでダウンロード")
+    with st.spinner("Excelファイルを生成中…"):
+        xls = build_excel(company_name, ticker, cik, pl, bs, mda_text, period)
+    fname = f"{ticker}_financial_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    st.download_button("📥 分析結果をExcelでダウンロード", data=xls, file_name=fname,
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)
+    st.caption(f"ファイル名: `{fname}`  |  シート: Dashboard / Financial Data / MD&A_Text")
+
+elif st.session_state.get("filings"):
+    filings = st.session_state.filings
+    labels  = [f["label"] for f in filings]
+    col_sel, col_run = st.columns([4, 1.4])
+    with col_sel:
+        selected_label = st.selectbox("対象決算期（10-Q / 10-K）", labels,
+                                      help="最新期がデフォルトで選択されています")
+    with col_run:
+        st.markdown("<br>", unsafe_allow_html=True)
+        run_btn = st.button("🔍 財務分析を実行", type="primary", use_container_width=True)
+
+    selected = next(f for f in filings if f["label"] == selected_label)
+
+    if run_btn:
+        ticker       = st.session_state.last_ticker
+        cik          = st.session_state.cik
+        company_name = st.session_state.company_name
+        period       = selected["period"]
+
+        with st.spinner("財務データとMD&Aテキストを取得中（10〜30秒かかる場合があります）…"):
+            if st.session_state.facts is None:
+                facts = fetch_facts(cik)
+                st.session_state.facts = facts
+            else:
+                facts = st.session_state.facts
+
+            if not facts:
+                st.error("EDGAR XBRLデータを取得できませんでした。しばらく時間をおいて再試行してください。")
+                st.stop()
+
+            if not company_name or company_name == ticker:
+                company_name = facts.get("entityName", ticker)
+                st.session_state.company_name = company_name
+
+            pl  = extract_pl(facts, period)
+            bs  = extract_bs(facts, period)
+            mda = fetch_mda(cik, selected["accession"], selected["primary_doc"])
+
+        ratios  = compute_ratios(bs)
+        verdict, v_hex, v_emoji = risk_verdict(ratios)
+
+        cls = ("alert-red" if "FFD2D2" in v_hex else
+               "alert-yellow" if "FACD" in v_hex else
+               "alert-grey" if "F2F2" in v_hex else "alert-green")
+        st.markdown(f'<div class="alert-box {cls}">{v_emoji} {verdict.replace(chr(10),"  |  ")}</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f"### 🏢 {company_name}  `{ticker.upper()}`  —  期間: `{period}`  ({selected['form']})")
+
+        k1,k2,k3,k4,k5,k6 = st.columns(6)
+        def _ps(v): return f"{v:.1%}" if v is not None else "N/A"
+        def _rs(v): return f"{v:.2f}" if v is not None else "N/A"
+        def _ms(v): return f"${v:,.0f}M" if v is not None else "N/A"
+        k1.metric("流動比率", _rs(ratios["current_ratio"]))
+        k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
+        k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
+        k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
+        k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
+        k6.metric("現金残高", _ms(ratios["cash_cur"]))
+        st.markdown("---")
+
+        st.markdown("## 📊 損益計算書（P&L） — 前年同期比（YoY）3ヶ月実績")
+        st.dataframe(_style_df(build_pl_df(pl)), use_container_width=True, height=270)
+        st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
+
+        st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
+        st.dataframe(_style_df(build_bs_df(bs)), use_container_width=True, height=310)
+
+        st.markdown("---")
+        st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
+        st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
+        if mda:
+            st.text_area("MD&A テキスト", value=mda, height=420, label_visibility="collapsed")
+        else:
+            st.warning("MD&Aテキストを取得できませんでした。")
+        st.markdown("---")
+
+        st.markdown("## 📥 分析結果をExcelでダウンロード")
+        st.markdown("Dashboard / Financial Data / MD&A_Text の3シート構成、数式・ハイライト付き。")
+        with st.spinner("Excelファイルを生成中…"):
+            xls = build_excel(company_name, ticker, cik, pl, bs, mda or "", period)
+        fname = f"{ticker.upper()}_financial_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        st.download_button("📥 分析結果をExcelでダウンロード", data=xls, file_name=fname,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
+        st.caption(f"ファイル名: `{fname}`  |  シート: Dashboard / Financial Data / MD&A_Text")
 
 else:
     st.markdown("""
     <div style="text-align:center;padding:60px 20px;color:#8B9BB4;">
     <div style="font-size:4rem;">📊</div>
-    <div style="font-size:1.2rem;font-weight:600;margin:12px 0;">ティッカーを入力して「分析実行」を押してください</div>
-    <div style="font-size:.9rem;">対応例: PARR · XOM · CVX · TSLA · AAPL · MSFT · AMZN など</div>
-    <div style="font-size:.85rem;margin-top:8px;color:#AAB8C8;">
-    ネットワーク不要のデモは「🧪 デモデータ」ボタンで確認できます
+    <div style="font-size:1.2rem;font-weight:600;margin:12px 0;">
+        ① ティッカーを入力 → 「📋 決算期リストを取得」<br>
+        ② 決算期を選択 → 「🔍 財務分析を実行」
+    </div>
+    <div style="font-size:.9rem;margin-top:8px;">対応例: PARR · XOM · CVX · TSLA · AAPL · MSFT · AMZN</div>
+    <div style="font-size:.85rem;margin-top:6px;color:#AAB8C8;">
+        ネットワーク不要の動作確認は「🧪 デモデータ」ボタン
     </div>
     </div>
     """, unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("データソース: SEC EDGAR XBRL API (data.sec.gov) | 本ツールは情報提供目的のみです。投資判断には必ず一次情報をご確認ください。")
+st.caption("Source: SEC EDGAR XBRL API (data.sec.gov) | 本ツールは情報提供目的のみです。投資判断には必ず一次情報をご確認ください。")
