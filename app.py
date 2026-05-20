@@ -261,62 +261,88 @@ def _strip_html(html: str) -> str:
         return re.sub(r"<[^>]+>", " ", html)
 
 
-def extract_mda(html: str, form_type: str = "10-Q", max_chars: int = 30000) -> str:
-    # Remove table HTML — keep narrative prose only, skip financial data tables
-    html = re.sub(r'<table[\s>].*?</table>', ' ', html, flags=re.IGNORECASE | re.DOTALL)
-    text = _strip_html(html)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+def extract_mda(html: str, form_type: str = "10-Q", max_chars: int = 30_000) -> str:
+    """Extract MD&A prose from a SEC filing HTML.
 
-    # 10-K: MD&A is under Item 7; 10-Q: MD&A is under Item 2
+    10-K : Item 7  ...  Item 7A / Item 8
+    10-Q : Item 2  ...  Item 3
+    Tables are stripped before extraction.
+    When TOC and body both match, the match with the most content before
+    the end marker is selected (body always wins over a brief TOC entry).
+    """
+    # ── Strip all HTML tables (removes TOC tables + financial tables) ──────
+    html = re.sub(r'<table[\s>].*?</table>', ' ', html,
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = _strip_html(html)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # Apostrophe / right-single-quote variants used in SEC filings
+    _AP = "[\u2019\u2018'\u0060]"
+
     if form_type == "10-K":
-        start_pats = [
-            r"(?i)ITEM\s*7[\.\:\-\u2014\s]+MANAGEMENT[\u2019'\u2018'\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
-            r"(?i)ITEM\s*7\b.{0,10}MANAGEMENT.{0,60}DISCUSSION",
-            r"(?i)ITEM\s*7[\.\:\-\u2014\s]+MD&A",
-            r"(?i)ITEM\s*7\b",
-        ]
+        # 10-K: MD&A is Item 7, ends at Item 7A or Item 8
+        full_title = (r'(?i)ITEM[\s.]*7[.\s]+'
+                      r'MANAGEMENT' + "[\u2019\u2018'\u0060]?" + r'S[\s]+'
+                      r'DISCUSSION[\s]+AND[\s]+ANALYSIS[\s]+OF[\s]+'
+                      r'FINANCIAL[\s]+CONDITION[\s]+AND[\s]+RESULTS[\s]+OF[\s]+OPERATIONS')
+        short_title = r'(?i)ITEM[\s.]*7[.\s]+MANAGEMENT'
+        bare        = r'(?i)\bITEM\s*7\b'
+        start_pats = [full_title, short_title, bare]
         end_pats = [
-            r"(?i)ITEM\s*7A[\.\:\-\u2014\s]+QUANTITATIVE",
-            r"(?i)ITEM\s*7A\b",
-            r"(?i)ITEM\s*8[\.\:\-\u2014\s]+FINANCIAL\s+STATEMENTS",
-            r"(?i)\bITEM\s*8\b",
+            r'(?i)\bITEM\s*7A[.\s]',
+            r'(?i)\bITEM\s*7A\b',
+            r'(?i)\bITEM\s*8[.\s]',
+            r'(?i)\bITEM\s*8\b',
         ]
     else:
-        start_pats = [
-            r"(?i)ITEM\s*2[\.\:\-\u2014\s]+MANAGEMENT[\u2019'\u2018'\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
-            r"(?i)ITEM\s*2\b.{0,10}MANAGEMENT.{0,60}DISCUSSION",
-            r"(?i)Management[\u2019'\u2018'\s]*s\s+Discussion\s+and\s+Analysis\s+of\s+Financial\s+Condition",
-            r"(?i)MANAGEMENT[\u2019'\u2018'\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
-            r"(?i)ITEM\s*2\b",
-        ]
+        # 10-Q: MD&A is Item 2, ends at Item 3
+        full_title = (r'(?i)ITEM[\s.]*2[.\s]+'
+                      r'MANAGEMENT' + "[\u2019\u2018'\u0060]?" + r'S[\s]+'
+                      r'DISCUSSION[\s]+AND[\s]+ANALYSIS[\s]+OF[\s]+'
+                      r'FINANCIAL[\s]+CONDITION[\s]+AND[\s]+RESULTS[\s]+OF[\s]+OPERATIONS')
+        short_title = r'(?i)ITEM[\s.]*2[.\s]+MANAGEMENT'
+        bare        = r'(?i)\bITEM\s*2\b'
+        start_pats = [full_title, short_title, bare]
         end_pats = [
-            r"(?i)ITEM\s*3[\.\:\-\u2014\s]+QUANTITATIVE",
-            r"(?i)ITEM\s*3[\.\:\-\u2014\s]+MARKET\s+RISK",
-            r"(?i)\bITEM\s*3[\.\:\-\u2014\s]",
-            r"(?i)\bITEM\s*4\b",
-            r"(?i)PART\s+II\b",
+            r'(?i)\bITEM\s*3[.\s]',
+            r'(?i)\bITEM\s*3\b',
+            r'(?i)\bITEM\s*4\b',
         ]
 
-    start = -1
+    # ── Find best start: pick the match with the most content to the end ──
+    best_start = -1
+    best_content_len = 0
     for pat in start_pats:
-        m = re.search(pat, text)
-        if m:
-            start = m.start()
-            break
+        matched_any = False
+        for m in re.finditer(pat, text):
+            matched_any = True
+            pos = m.start()
+            after_header = pos + len(m.group())
+            probe = text[after_header: after_header + 120_000]
+            end_off = len(probe)
+            for ep in end_pats:
+                em = re.search(ep, probe)
+                if em:
+                    end_off = min(end_off, em.start())
+            if end_off > best_content_len:
+                best_content_len = end_off
+                best_start = pos
+        if matched_any:
+            break   # use first pattern level that has any match
 
-    if start == -1:
+    if best_start == -1:
         return text[:max_chars].strip()
 
-    tail = text[start + 200:]
+    # ── Cut from best_start to the nearest end marker ────────────────────
+    tail = text[best_start:]
     end_offset = len(tail)
     for pat in end_pats:
-        m = re.search(pat, tail)
+        m = re.search(pat, tail[80:])   # skip past the section header
         if m:
-            end_offset = min(end_offset, m.start())
+            end_offset = min(end_offset, m.start() + 80)
 
-    mda = text[start: start + 200 + end_offset].strip()
-    return mda[:max_chars]
+    return tail[:end_offset].strip()[:max_chars]
 
 
 def fetch_mda(cik: str, accession: str, primary_doc: str, form_type: str = "10-Q") -> str:
@@ -798,19 +824,46 @@ def compute_ratios(bs: dict) -> dict:
 
 
 def risk_verdict(r: dict) -> tuple[str, str, str]:
-    cash_drop  = r["cash_qoq"] is not None and r["cash_qoq"] < -0.20
-    cl_surge   = r["cl_qoq"]   is not None and r["cl_qoq"]   > 0.20
-    eq_erosion = r["eq_qoq"]   is not None and r["eq_qoq"]   < -0.20
-    if cash_drop and (cl_surge or eq_erosion):
-        return "⚠️ 黒字倒産・資金繰り悪化の予兆あり\nCash shrinking while liabilities surge or equity erodes.", "#FFD2D2", "🔴"
-    n = sum([cash_drop, cl_surge, eq_erosion])
+    """Return (message, bg_hex, emoji) based on KPI threshold checks.
+    Any single triggered alert results in at least a yellow warning.
+    """
+    alerts = []
+
+    # ── 絶対水準チェック ──────────────────────────────────────────────────────
+    cr = r.get("current_ratio")
+    if cr is not None and cr < 1.0:
+        alerts.append(f"⚠️ 流動比率 {cr:.2f} < 1.0（短期支払い能力不足）")
+
+    er = r.get("equity_ratio")
+    if er is not None and er < 0.30:
+        alerts.append(f"⚠️ 自己資本比率 {er:.1%} < 30%（財務基盤が脆弱）")
+
+    # ── QoQ変化率チェック ─────────────────────────────────────────────────────
+    if r.get("cash_qoq") is not None and r["cash_qoq"] < -0.20:
+        alerts.append(f"⚠️ 現金 QoQ {r['cash_qoq']:+.1%}（急減）")
+    if r.get("cl_qoq") is not None and r["cl_qoq"] > 0.20:
+        alerts.append(f"⚠️ 流動負債 QoQ {r['cl_qoq']:+.1%}（急増）")
+    if r.get("eq_qoq") is not None and r["eq_qoq"] < -0.20:
+        alerts.append(f"⚠️ 株主資本 QoQ {r['eq_qoq']:+.1%}（急減）")
+
+    # ── データ不足 ─────────────────────────────────────────────────────────────
+    all_none = all(r.get(k) is None for k in
+                   ["current_ratio", "equity_ratio", "cash_qoq", "cl_qoq", "eq_qoq"])
+    if all_none:
+        return "— データ不足：判定不可 / Insufficient data.", "#F2F2F2", "⚪"
+
+    # ── 結果 ───────────────────────────────────────────────────────────────────
+    n = len(alerts)
+    if n == 0:
+        return "✅ 現時点で重大なリスクシグナルなし / No major risk signals.", "#D2FFD2", "🟢"
+
+    detail = "  |  ".join(alerts)
+    if n >= 3 or (r.get("cash_qoq") is not None and r["cash_qoq"] < -0.20
+                  and r.get("cl_qoq") is not None and r["cl_qoq"] > 0.20):
+        return f"🔴 重大なリスクシグナルを検知\n{detail}", "#FFD2D2", "🔴"
     if n >= 2:
-        return "⚡ 要注意：複数の財務悪化シグナルを検知\nMultiple deterioration signals.", "#FFFACD", "🟡"
-    if n == 1:
-        return "⚡ 軽微なリスクシグナルあり\nOne deterioration signal detected.", "#FFFACD", "🟡"
-    if all(v is None for v in [r["cash_qoq"], r["cl_qoq"], r["eq_qoq"]]):
-        return "— データ不足：判定不可\nInsufficient data.", "#F2F2F2", "⚪"
-    return "✅ 現時点で重大なリスクシグナルなし\nNo major risk signals detected.", "#D2FFD2", "🟢"
+        return f"🟡 要注意：複数の財務悪化シグナルを検知\n{detail}", "#FFFACD", "🟡"
+    return f"🟡 軽微なリスクシグナルあり\n{detail}", "#FFFACD", "🟡"
 
 
 _KPI_NOTES_MD = """
@@ -1335,17 +1388,13 @@ st.markdown("米国上場企業のティッカーと対象決算期を選択し�
 st.markdown("---")
 
 # ── Step 1: Ticker + period fetch ──────────────────────────────────────────
-col_t, col_f, col_d = st.columns([3, 1.4, 1.4])
+col_t, col_f = st.columns([3, 1.4])
 with col_t:
     ticker_input = st.text_input("ティッカーシンボル（例: PARR, XOM, TSLA）",
                                  value="PARR", max_chars=10)
 with col_f:
     st.markdown("<br>", unsafe_allow_html=True)
     fetch_btn = st.button("📋 決算期リストを取得", use_container_width=True)
-with col_d:
-    st.markdown("<br>", unsafe_allow_html=True)
-    demo_btn = st.button("🧪 デモデータ", use_container_width=True,
-                         help="ネットワーク不要のサンプルデータで動作確認")
 
 if fetch_btn:
     ticker = ticker_input.strip().upper()
@@ -1368,67 +1417,7 @@ if fetch_btn:
 st.markdown("---")
 
 # ── Step 2: Period selection + Analysis ────────────────────────────────────
-if demo_btn:
-    # --- Demo mode ---
-    pl, bs = demo_pl_bs()
-    ratios = compute_ratios(bs)
-    verdict, v_hex, v_emoji = risk_verdict(ratios)
-    mda_text  = DEMO_MDA
-    company_name = "PARR Inc. [DEMO DATA]"
-    ticker    = "PARR"
-    cik       = KNOWN_CIKS["PARR"]
-    period    = "2024-09-30"
-
-    cls = ("alert-red" if "FFD2D2" in v_hex else
-           "alert-yellow" if "FACD" in v_hex else
-           "alert-grey" if "F2F2" in v_hex else "alert-green")
-    st.markdown(f'<div class="alert-box {cls}">{v_emoji} {verdict.replace(chr(10),"  |  ")}</div>',
-                unsafe_allow_html=True)
-    st.markdown(f"### 🏢 {company_name}  `{ticker}`  —  期間: `{period}`")
-
-    k1,k2,k3,k4,k5 = st.columns(5)
-    def _ps(v): return f"{v:.1%}" if v is not None else "N/A"
-    def _rs(v): return f"{v:.2f}" if v is not None else "N/A"
-    k1.metric("流動比率", _rs(ratios["current_ratio"]))
-    k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
-    k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
-    k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
-    k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
-    with st.expander("📖 各指標の見方・チェック理由", expanded=False):
-        st.markdown(_KPI_NOTES_MD)
-    st.markdown("---")
-
-    st.markdown(f"## 📊 損益計算書（P&L） — 前年同期比（YoY）  `{_Q_PERIOD_LABELS[1]}`")
-    st.dataframe(_style_df(build_pl_df(pl)), width="stretch", height=270)
-    st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
-    st.caption(
-        "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
-        "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
-        "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
-    )
-
-    st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-    _bs_df = build_bs_df(bs)
-    st.dataframe(_style_df(_bs_df), width="stretch", height=340)
-    _bs_note = _bs_imbalance_note(_bs_df)
-    if _bs_note:
-        st.caption(_bs_note)
-
-    st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
-    st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
-    st.text_area("MD&A テキスト", value=mda_text, height=400, label_visibility="collapsed")
-    st.markdown("---")
-
-    st.markdown("## 📥 分析結果をExcelでダウンロード")
-    with st.spinner("Excelファイルを生成中…"):
-        xls = build_excel(company_name, ticker, cik, pl, bs, mda_text, period)
-    fname = f"{ticker}_financial_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    st.download_button("📥 分析結果をExcelでダウンロード", data=xls, file_name=fname,
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       use_container_width=True)
-    st.caption(f"ファイル名: `{fname}`  |  シート: Dashboard / Financial Data / MD&A_Text")
-
-elif st.session_state.get("filings"):
+if st.session_state.get("filings"):
     filings = st.session_state.filings
     labels  = [f["label"] for f in filings]
     col_sel, col_run = st.columns([4, 1.4])
@@ -1537,9 +1526,6 @@ else:
         ② 決算期を選択 → 「🔍 財務分析を実行」
     </div>
     <div style="font-size:.9rem;margin-top:8px;">対応例: PARR · XOM · CVX · TSLA · AAPL · MSFT · AMZN</div>
-    <div style="font-size:.85rem;margin-top:6px;color:#AAB8C8;">
-        ネットワーク不要の動作確認は「🧪 デモデータ」ボタン
-    </div>
     </div>
     """, unsafe_allow_html=True)
 
