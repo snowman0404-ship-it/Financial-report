@@ -1681,8 +1681,8 @@ if st.session_state.get("filings"):
         st.markdown(f"### 🏢 {company_name}  `{ticker.upper()}`  —  期間: `{period}`  ({selected['form']})")
 
         k1,k2,k3,k4,k5 = st.columns(5)
-        def _ps(v): return f"{round(v*100):.0f}%" if v is not None else "N/A"
-        def _rs(v): return f"{round(v)}" if v is not None else "N/A"
+        def _ps(v): return f"{v*100:.1f}%" if v is not None else "N/A"
+        def _rs(v): return f"{v:.1f}" if v is not None else "N/A"
         k1.metric("流動比率", _rs(ratios["current_ratio"]))
         k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
         k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
@@ -1751,16 +1751,15 @@ if st.session_state.get("filings"):
 
             # PER
             pe = yf_info.get("pe")
-            st.metric("PER（株価収益率）", f"{round(pe)}倍" if pe else "N/A")
+            st.metric("PER（株価収益率）", f"{pe:.1f}倍" if pe else "N/A")
 
             # PBR
             pb = yf_info.get("pb")
-            st.metric("PBR（株価純資産倍率）", f"{round(pb)}倍" if pb else "N/A")
+            st.metric("PBR（株価純資産倍率）", f"{pb:.1f}倍" if pb else "N/A")
 
             # Altman Z
             if z_data:
-                z_val = round(z_data["z"])
-                st.metric("アルトマンZスコア", f"{z_val}", delta=z_data["zone"])
+                st.metric("アルトマンZスコア", f"{z_data['z']:.1f}", delta=z_data["zone"])
             else:
                 st.metric("アルトマンZスコア", "N/A")
 
