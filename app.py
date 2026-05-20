@@ -333,18 +333,49 @@ def _best_tag(facts: dict, candidates: list) -> tuple[str, list]:
     return "", []
 
 
-def _filter_quarterly(records: list) -> list:
+def _filter_quarterly(records: list, lo: int = 75, hi: int = 110) -> list:
     out = []
     for r in records:
         s, e = r.get("start", ""), r.get("end", "")
         if s and e:
             try:
                 d = (datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(s, "%Y-%m-%d")).days
-                if 75 <= d <= 110:
+                if lo <= d <= hi:
                     out.append(r)
             except ValueError:
                 pass
     return out
+
+
+def _best_quarterly_tag(facts: dict, candidates: list) -> tuple[str, list, list]:
+    """Return (tag, all_recs, quarterly_recs) for the first candidate that has quarterly data.
+
+    Strategy:
+    1. Scan every candidate; pick the first whose records contain at least one
+       quarter-length duration (75-110 days, then relaxed 60-125 days as fallback).
+    2. If nothing qualifies, return the first candidate with any records so the
+       caller can still attempt the derivation fallback.
+    """
+    any_tag, any_recs = "", []
+    relaxed_tag, relaxed_recs, relaxed_q = "", [], []
+
+    for tag in candidates:
+        recs = _units(facts, tag)
+        if not recs:
+            continue
+        q = _filter_quarterly(recs, 75, 110)
+        if q:
+            return tag, recs, q
+        # Widen to ±2 weeks to catch fiscal-week-calendar quarters (e.g. 13×7=91±14)
+        q_wide = _filter_quarterly(recs, 60, 125)
+        if q_wide and not relaxed_tag:
+            relaxed_tag, relaxed_recs, relaxed_q = tag, recs, q_wide
+        if not any_recs:
+            any_tag, any_recs = tag, recs
+
+    if relaxed_tag:
+        return relaxed_tag, relaxed_recs, relaxed_q
+    return any_tag, any_recs, []
 
 
 def _filter_instant(records: list) -> list:
@@ -376,8 +407,10 @@ def extract_pl(facts: dict, target_period: str | None = None) -> dict:
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
     result = {}
     for metric, candidates in PL_TAGS.items():
-        tag, recs = _best_tag(facts, candidates)
-        quarterly = _dedup_latest(_filter_quarterly(recs), 30)
+        # Use _best_quarterly_tag so we skip through candidate tags until we find
+        # one with actual quarterly-duration records, not just any records.
+        tag, _recs, quarterly = _best_quarterly_tag(facts, candidates)
+        quarterly = _dedup_latest(quarterly, 30)
         current = prior = None
         if quarterly:
             cur_rec = _find_closest(quarterly, target, 55) if target else quarterly[0]
@@ -392,7 +425,8 @@ def extract_pl(facts: dict, target_period: str | None = None) -> dict:
                 prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
-    # Derive OperatingExpenses = Revenues - OperatingIncomeLoss per period independently
+    # Derive OperatingExpenses = Revenues − OperatingIncomeLoss per period independently.
+    # Runs for each period where the XBRL tags above yielded no value.
     rev = result.get("Revenues", {})
     opi = result.get("OperatingIncomeLoss", {})
     for which in ("current", "prior"):
