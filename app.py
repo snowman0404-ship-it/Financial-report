@@ -1063,7 +1063,7 @@ _L      = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 _R      = Alignment(horizontal="right",  vertical="center")
 
 FMT_USD   = '#,##0_);[Red](#,##0)'
-FMT_PCT   = '0.0%;[Red]-0.0%'
+FMT_PCT   = '0%;[Red]-0%'
 FMT_RATIO = '0.00'
 
 
@@ -1511,6 +1511,14 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+st.markdown("""<style>
+#MainMenu {visibility: hidden;}
+header {visibility: hidden;}
+footer {visibility: hidden;}
+[data-testid="stDeployButton"] {display: none;}
+[data-testid="stToolbar"] {display: none;}
+</style>""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
 [data-testid="stAppViewContainer"] { background: #F7F9FC; }
@@ -1537,7 +1545,7 @@ h2 { color: #2E75B6; font-size:1.1rem; margin-top:1.2rem; margin-bottom:0.3rem; 
 """, unsafe_allow_html=True)
 
 # Session state init
-for k in ("filings", "last_ticker", "cik", "company_name", "facts"):
+for k in ("filings", "last_ticker", "cik", "company_name", "facts", "search_results"):
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -1550,14 +1558,53 @@ st.caption(
 st.markdown("米国上場企業のティッカーと対象決算期を選択して「財務分析を実行」してください。")
 st.markdown("---")
 
-# ── Step 1: Ticker + period fetch ──────────────────────────────────────────
-col_t, col_f = st.columns([3, 1.4])
-with col_t:
-    ticker_input = st.text_input("ティッカーシンボル（例: PARR, XOM, TSLA）",
-                                 value="PARR", max_chars=10)
-with col_f:
+# ── Step 1: Company name search ────────────────────────────────────────────
+col_search, col_btn = st.columns([3, 1.4])
+with col_search:
+    company_query = st.text_input("会社名を入力（英語）", value="Par Pacific", placeholder="例: Par Pacific, ExxonMobil, Tesla")
+with col_btn:
     st.markdown("<br>", unsafe_allow_html=True)
-    fetch_btn = st.button("📋 決算期リストを取得", use_container_width=True)
+    search_btn = st.button("🔍 企業を検索", use_container_width=True)
+
+# Search results as selectbox
+if search_btn or st.session_state.get("search_results"):
+    if search_btn:
+        candidates = _search_tickers(company_query)
+        st.session_state.search_results = candidates
+    else:
+        candidates = st.session_state.get("search_results", [])
+
+    if candidates:
+        options = [f"{c['ticker']} — {c['name']}" for c in candidates]
+        # Add manual entry option
+        options.append("✏️ 手動でティッカーを入力")
+        col_sel, col_fetch = st.columns([3, 1.4])
+        with col_sel:
+            chosen = st.selectbox("企業を選択してください", options)
+        with col_fetch:
+            st.markdown("<br>", unsafe_allow_html=True)
+            fetch_btn = st.button("📋 決算期リストを取得", use_container_width=True)
+
+        if chosen == "✏️ 手動でティッカーを入力":
+            ticker_input = st.text_input("ティッカーシンボルを直接入力", value="PARR")
+        else:
+            ticker_input = chosen.split(" — ")[0]
+    else:
+        st.warning("候補が見つかりませんでした。ティッカーを直接入力してください。")
+        col_t, col_f = st.columns([3, 1.4])
+        with col_t:
+            ticker_input = st.text_input("ティッカーシンボル（例: PARR, XOM, TSLA）", value="PARR")
+        with col_f:
+            st.markdown("<br>", unsafe_allow_html=True)
+            fetch_btn = st.button("📋 決算期リストを取得", use_container_width=True)
+else:
+    # Default: show search box without results yet
+    col_t, col_f = st.columns([3, 1.4])
+    with col_t:
+        ticker_input = st.text_input("ティッカーシンボル（例: PARR, XOM, TSLA）", value="PARR")
+    with col_f:
+        st.markdown("<br>", unsafe_allow_html=True)
+        fetch_btn = st.button("📋 決算期リストを取得", use_container_width=True)
 
 if fetch_btn:
     ticker = ticker_input.strip().upper()
@@ -1616,8 +1663,9 @@ if st.session_state.get("filings"):
 
             _q_num = _quarter_num(period, selected.get("fy_end", "1231")) \
                      if selected.get("form") != "10-K" else 4
+            is_parr = (ticker.upper() == "PARR")
             pl  = extract_pl(facts, period, form_type=selected.get("form", "10-Q"),
-                             quarter_num=_q_num)
+                             quarter_num=_q_num, is_parr=is_parr)
             bs  = extract_bs(facts, period)
             mda = fetch_mda(cik, selected["accession"], selected["primary_doc"],
                             form_type=selected.get("form", "10-Q"))
@@ -1633,8 +1681,8 @@ if st.session_state.get("filings"):
         st.markdown(f"### 🏢 {company_name}  `{ticker.upper()}`  —  期間: `{period}`  ({selected['form']})")
 
         k1,k2,k3,k4,k5 = st.columns(5)
-        def _ps(v): return f"{v:.1%}" if v is not None else "N/A"
-        def _rs(v): return f"{v:.2f}" if v is not None else "N/A"
+        def _ps(v): return f"{round(v*100):.0f}%" if v is not None else "N/A"
+        def _rs(v): return f"{round(v)}" if v is not None else "N/A"
         k1.metric("流動比率", _rs(ratios["current_ratio"]))
         k2.metric("自己資本比率", _ps(ratios["equity_ratio"]))
         k3.metric("現金 QoQ", _ps(ratios["cash_qoq"]))
@@ -1646,7 +1694,8 @@ if st.session_state.get("filings"):
 
         _ql = _Q_PERIOD_LABELS.get(_q_num, "")
         st.markdown(f"## 📊 損益計算書（P&L） — 前年同期比（YoY）  `{_ql}`")
-        st.dataframe(_style_df(build_pl_df(pl)), width="stretch", height=270)
+        _pl_labels = PL_LABELS if is_parr else SIMPLE_PL_LABELS
+        st.dataframe(_style_df(build_pl_df(pl, labels=_pl_labels)), width="stretch", height=270)
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
         st.caption(
             "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
@@ -1679,6 +1728,51 @@ if st.session_state.get("filings"):
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True)
         st.caption(f"ファイル名: `{fname}`  |  シート: Dashboard / Financial Data / MD&A_Text")
+
+        st.markdown("---")
+        st.markdown("## 📈 5年間株価推移 & バリュエーション指標")
+
+        # Two columns: chart on left, valuation on right
+        col_chart, col_val = st.columns([3, 2])
+
+        with col_chart:
+            st.markdown("### 📈 過去5年間の株価推移")
+            with st.spinner("株価データを取得中..."):
+                hist = _get_stock_history(ticker)
+            if hist is not None and not hist.empty:
+                st.line_chart(hist, height=300)
+            else:
+                st.info("株価データを取得できませんでした（ネットワーク制限の可能性があります）")
+
+        with col_val:
+            st.markdown("### 💹 バリュエーション指標")
+            yf_info = _get_yf_info(ticker)
+            z_data = compute_altman_z(bs, pl)
+
+            # PER
+            pe = yf_info.get("pe")
+            st.metric("PER（株価収益率）", f"{round(pe)}倍" if pe else "N/A")
+
+            # PBR
+            pb = yf_info.get("pb")
+            st.metric("PBR（株価純資産倍率）", f"{round(pb)}倍" if pb else "N/A")
+
+            # Altman Z
+            if z_data:
+                z_val = round(z_data["z"])
+                st.metric("アルトマンZスコア", f"{z_val}", delta=z_data["zone"])
+            else:
+                st.metric("アルトマンZスコア", "N/A")
+
+            # Explanation expander
+            with st.expander("📖 各指標の見方", expanded=False):
+                st.markdown("""
+| 指標 | 見方 |
+|------|------|
+| **PER** | 株価÷EPS。**15〜20倍**が標準。30倍超は割高警戒。赤字時はN/A。 |
+| **PBR** | 株価÷1株純資産。**1倍割れ**は理論上割安。エネルギーは1〜2倍が標準。 |
+| **Zスコア** | 倒産確率モデル。**2.99超**=安全圏、**1.81〜2.99**=グレーゾーン、**1.81未満**=危険圏。 |
+""")
 
 else:
     st.markdown("""
