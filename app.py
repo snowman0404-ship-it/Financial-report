@@ -675,7 +675,7 @@ def _style_df(df: pd.DataFrame):
 
     def highlight_row(row):
         alert = str(row["アラート"]) if "アラート" in row.index else ""
-        bg = "#FFD2D2" if "⚠️" in alert else ""
+        bg = "background-color: #FFD2D2" if "⚠️" in alert else ""
         return pd.Series([bg] * len(row), index=row.index)
 
     fmt = {c: "{:,.1f}" for c in numeric_cols}
