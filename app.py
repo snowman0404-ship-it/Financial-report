@@ -74,20 +74,40 @@ BS_TAGS = {
         "CashAndCashEquivalentsAtCarryingValue",
         "CashCashEquivalentsAndShortTermInvestments",
         "CashAndShortTermInvestments", "Cash",
+        "CashAndCashEquivalentsAndRestrictedCashAndRestrictedCashEquivalents",
     ],
-    "CurrentLiabilities": ["LiabilitiesCurrent"],
-    "CurrentAssets":      ["AssetsCurrent"],
+    "CurrentLiabilities": [
+        "LiabilitiesCurrent",
+        "LiabilitiesCurrentAndNoncurrent",
+    ],
+    "CurrentAssets": [
+        "AssetsCurrent",
+        "AssetsCurrentAndNoncurrent",
+    ],
     "LongTermLiabilities": [
-        "LiabilitiesNoncurrent", "LongTermDebtNoncurrent",
-        "LongTermDebt", "LongTermDebtAndCapitalLeaseObligations",
+        "LongTermDebt",
+        "LongTermDebtNoncurrent",
+        "LiabilitiesNoncurrent",
+        "LongTermDebtAndCapitalLeaseObligations",
+        "LongTermDebtAndFinanceLeaseLiabilities",
+        "FinanceLeaseLiabilityNoncurrent",
+        "LongTermLineOfCredit",
+        "SeniorLongTermNotes",
+        "DebtAndCapitalLeaseObligations",
     ],
     "NonCurrentAssets": [
-        "AssetsNoncurrent", "PropertyPlantAndEquipmentNet",
+        "AssetsNoncurrent",
+        "PropertyPlantAndEquipmentNet",
         "PropertyPlantAndEquipmentAndIntangibleAssetsNet",
+        "PropertyPlantAndEquipmentNetIncludingDiscontinuedOperations",
+        "NoncurrentAssets",
+        "PropertyPlantAndEquipmentGross",
     ],
     "StockholdersEquity": [
-        "StockholdersEquity", "StockholdersEquityAttributableToParent",
+        "StockholdersEquity",
+        "StockholdersEquityAttributableToParent",
         "PartnersCapital", "MembersEquity",
+        "LiabilitiesAndStockholdersEquity",
     ],
 }
 
@@ -378,83 +398,136 @@ def _m(val):
         return None
 
 
-def _alert(pct, is_bad_if_high: bool) -> str:
+def _safe_val(data: dict, which: str):
+    """Extract float value from a (val, date, tag) tuple safely."""
+    v = data.get(which)
+    return _m(v[0]) if v is not None else None
+
+
+def _canon_date(dataset: dict, which: str) -> str:
+    """Find the most-represented period date across all metrics."""
+    from collections import Counter
+    dates = []
+    for data in dataset.values():
+        v = data.get(which)
+        if v is not None:
+            dates.append(v[1])
+    if not dates:
+        return "—"
+    return Counter(dates).most_common(1)[0][0]
+
+
+def _period_ok(data: dict, which: str, canon: str, tolerance_days: int = 50) -> bool:
+    """Return True if a metric's period date is within tolerance of canonical date."""
+    v = data.get(which)
+    if v is None or canon == "—":
+        return False
+    try:
+        diff = abs((datetime.strptime(v[1], "%Y-%m-%d")
+                    - datetime.strptime(canon, "%Y-%m-%d")).days)
+        return diff <= tolerance_days
+    except ValueError:
+        return False
+
+
+def _pct_label(pct, cur, pri, is_bad_if_high: bool) -> str:
+    """Human-readable % change with sign-flip awareness."""
+    if pct is None:
+        return "N/A"
+    # Sign-change cases
+    if cur is not None and pri is not None:
+        if pri < 0 and cur > 0:
+            return "黒字転換" if not is_bad_if_high else f"{pct:+.1%}"
+        if pri > 0 and cur < 0:
+            return "赤字転落" if not is_bad_if_high else f"{pct:+.1%}"
+    return f"{pct:+.1%}"
+
+
+def _alert(pct, cur, pri, is_bad_if_high: bool) -> str:
     if pct is None:
         return "—"
+    # Sign-flip cases for income/asset metrics
+    if not is_bad_if_high and cur is not None and pri is not None:
+        if pri < 0 and cur > 0:
+            return "✅ 黒字転換"
+        if pri > 0 and cur < 0:
+            return "⚠️ 赤字転落"
     if is_bad_if_high:
         return "⚠️ +20%↑ 急増" if pct > 0.20 else "✅ 正常"
     return "⚠️ -20%↓ 急減" if pct < -0.20 else ("✅ +20%↑ 成長" if pct > 0.20 else "✅ 正常")
 
 
 def build_pl_df(pl: dict) -> pd.DataFrame:
+    # ① Determine canonical period dates (most common across metrics)
+    canon_cur = _canon_date(pl, "current")
+    canon_pri = _canon_date(pl, "prior")
+    cur_col   = f"当期 ({canon_cur})\n[USD M]"
+    pri_col   = f"前期 ({canon_pri})\n[USD M]"
+
     rows = []
     for key, label in PL_LABELS.items():
-        data  = pl.get(key, {})
-        cur   = _m(data["current"][0]) if data.get("current") else None
-        pri   = _m(data["prior"][0])   if data.get("prior")   else None
-        cdp   = data["current"][1]     if data.get("current") else "—"
-        pdp   = data["prior"][1]       if data.get("prior")   else "—"
-        tag   = data["current"][2]     if data.get("current") else "—"
-        delta = (cur - pri)            if (cur is not None and pri is not None) else None
-        pct   = delta / abs(pri)       if (delta is not None and pri not in (None, 0)) else None
+        data = pl.get(key, {})
+        # ② Only accept values whose period aligns with the canonical date
+        cur = _safe_val(data, "current") if _period_ok(data, "current", canon_cur) else None
+        pri = _safe_val(data, "prior")   if _period_ok(data, "prior",   canon_pri) else None
+        tag = data["current"][2]         if data.get("current") else "—"
+
+        delta = (cur - pri) if (cur is not None and pri is not None) else None
+        pct   = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
         is_cost = key == "OperatingExpenses"
         rows.append({
-            "項目 / Metric":              label,
-            f"当期 ({cdp})\n[USD M]":    cur,
-            f"前期 ({pdp})\n[USD M]":    pri,
-            "差額 [USD M]":              delta,
-            "変化率 %":                   pct,
-            "アラート":                   _alert(pct, is_cost),
-            "_pct": pct, "_is_cost": is_cost, "_cdp": cdp, "_pdp": pdp, "_tag": tag,
+            "項目 / Metric": label,
+            cur_col:         cur,
+            pri_col:         pri,
+            "差額 [USD M]":  delta,
+            "変化率 %":       _pct_label(pct, cur, pri, is_cost),
+            "アラート":       _alert(pct, cur, pri, is_cost),
+            "_pct": pct, "_is_cost": is_cost, "_cur": cur, "_pri": pri, "_tag": tag,
         })
     return pd.DataFrame(rows)
 
 
 def build_bs_df(bs: dict) -> pd.DataFrame:
+    # ① Canonical dates
+    canon_cur = _canon_date(bs, "current")
+    canon_pri = _canon_date(bs, "prior")
+    cur_col   = f"当四半期末 ({canon_cur})\n[USD M]"
+    pri_col   = f"前四半期末 ({canon_pri})\n[USD M]"
+
     rows = []
-    cdp_global = pdp_global = "—"
     for key, label in BS_LABELS.items():
-        data   = bs.get(key, {})
-        cur    = _m(data["current"][0]) if data.get("current") else None
-        pri    = _m(data["prior"][0])   if data.get("prior")   else None
-        cdp    = data["current"][1]     if data.get("current") else "—"
-        pdp    = data["prior"][1]       if data.get("prior")   else "—"
-        tag    = data["current"][2]     if data.get("current") else "—"
-        delta  = (cur - pri)            if (cur is not None and pri is not None) else None
-        pct    = delta / abs(pri)       if (delta is not None and pri not in (None, 0)) else None
+        data = bs.get(key, {})
+        cur  = _safe_val(data, "current") if _period_ok(data, "current", canon_cur) else None
+        pri  = _safe_val(data, "prior")   if _period_ok(data, "prior",   canon_pri) else None
+        tag  = data["current"][2]         if data.get("current") else "—"
+
+        delta   = (cur - pri) if (cur is not None and pri is not None) else None
+        pct     = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
         is_liab = key in ("CurrentLiabilities", "LongTermLiabilities")
-        if cdp != "—":
-            cdp_global = cdp
-        if pdp != "—":
-            pdp_global = pdp
         rows.append({
-            "項目 / Metric":                     label,
-            f"当四半期末 ({cdp})\n[USD M]":      cur,
-            f"前四半期末 ({pdp})\n[USD M]":      pri,
-            "差額 [USD M]":                      delta,
-            "変化率 %":                           pct,
-            "アラート":                           _alert(pct, is_liab),
-            "_pct": pct, "_is_cost": is_liab, "_tag": tag,
+            "項目 / Metric": label,
+            cur_col:         cur,
+            pri_col:         pri,
+            "差額 [USD M]":  delta,
+            "変化率 %":       _pct_label(pct, cur, pri, is_liab),
+            "アラート":       _alert(pct, cur, pri, is_liab),
+            "_pct": pct, "_is_cost": is_liab, "_cur": cur, "_pri": pri, "_tag": tag,
         })
-    # Other Current Assets (derived)
-    def _bsv(key, which):
-        v = bs.get(key, {}).get(which)
-        return _m(v[0]) if v is not None else None
-    ca   = _bsv("CurrentAssets", "current")
-    ca_p = _bsv("CurrentAssets", "prior")
-    cash = _bsv("Cash", "current")
-    cashp= _bsv("Cash", "prior")
-    oca  = (ca - cash)     if (ca is not None and cash is not None)   else None
-    ocap = (ca_p - cashp)  if (ca_p is not None and cashp is not None) else None
-    oca_d= (oca - ocap)   if (oca is not None and ocap is not None)  else None
-    oca_pct = oca_d / abs(ocap) if (oca_d is not None and ocap not in (None, 0)) else None
+    # ③ Other Current Assets (derived)
+    def _bv(k, w): return _safe_val(bs.get(k, {}), w) if _period_ok(bs.get(k, {}), w, canon_cur if w == "current" else canon_pri) else None
+    ca  = _bv("CurrentAssets", "current"); ca_p  = _bv("CurrentAssets", "prior")
+    cash= _bv("Cash", "current");          cashp = _bv("Cash", "prior")
+    oca = (ca - cash)   if (ca   is not None and cash  is not None) else None
+    ocap= (ca_p - cashp)if (ca_p is not None and cashp is not None) else None
+    oca_d  = (oca - ocap) if (oca is not None and ocap is not None) else None
+    oca_pct= oca_d / abs(ocap) if (oca_d is not None and ocap not in (None, 0)) else None
     rows.append({
         "項目 / Metric": "その他流動資産 / Other Current Assets (=CurrentAssets−Cash)",
-        f"当四半期末 ({cdp_global})\n[USD M]": oca,
-        f"前四半期末 ({pdp_global})\n[USD M]": ocap,
-        "差額 [USD M]": oca_d, "変化率 %": oca_pct,
-        "アラート": _alert(oca_pct, False),
-        "_pct": oca_pct, "_is_cost": False, "_tag": "(計算値)",
+        cur_col: oca, pri_col: ocap,
+        "差額 [USD M]": oca_d,
+        "変化率 %":      _pct_label(oca_pct, oca, ocap, False),
+        "アラート":      _alert(oca_pct, oca, ocap, False),
+        "_pct": oca_pct, "_is_cost": False, "_cur": oca, "_pri": ocap, "_tag": "(計算値)",
     })
     return pd.DataFrame(rows)
 
@@ -466,12 +539,23 @@ def _style_df(df: pd.DataFrame):
     display_cols = [c for c in df.columns if not c.startswith("_")]
     display_df   = df[display_cols].reset_index(drop=True)
 
+    # Convert None → NaN in numeric cols so na_rep="N/A" applies correctly
+    for col in display_cols:
+        if "USD M" in col or "差額" in col:
+            display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
+
     def highlight_row(row):
         idx     = row.name
         pct     = df.iloc[idx]["_pct"]
         is_cost = df.iloc[idx]["_is_cost"]
+        cur     = df.iloc[idx].get("_cur")
+        pri     = df.iloc[idx].get("_pri")
         if pct is None or (isinstance(pct, float) and pd.isna(pct)):
             bg = ""
+        elif not is_cost and cur is not None and pri is not None and pri > 0 and cur < 0:
+            bg = "background-color: #FFD2D2;"   # 赤字転落
+        elif not is_cost and cur is not None and pri is not None and pri < 0 and cur > 0:
+            bg = ""                              # 黒字転換はハイライトなし
         else:
             bad = (is_cost and pct > 0.20) or (not is_cost and pct < -0.20)
             bg  = "background-color: #FFD2D2;" if bad else ""
@@ -482,20 +566,15 @@ def _style_df(df: pd.DataFrame):
             return "N/A"
         return f"{v:,.1f}"
 
-    def fmt_pct(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return "N/A"
-        return f"{v:+.1%}"
-
     fmt       = {c: fmt_usd for c in display_cols if "USD M" in c or "差額" in c}
-    fmt["変化率 %"] = fmt_pct
-    right_cols = [c for c in display_cols if c not in ("項目 / Metric", "アラート")]
+    right_cols = [c for c in display_cols if c not in ("項目 / Metric", "アラート", "変化率 %")]
 
     return (
         display_df.style
         .apply(highlight_row, axis=1)
         .format(fmt, na_rep="N/A")
         .set_properties(**{"text-align": "right"},  subset=right_cols)
+        .set_properties(**{"text-align": "right"},  subset=["変化率 %"])
         .set_properties(**{"text-align": "left"},   subset=["項目 / Metric"])
         .set_properties(**{"text-align": "center"}, subset=["アラート"])
     )
