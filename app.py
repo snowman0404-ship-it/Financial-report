@@ -261,20 +261,43 @@ def _strip_html(html: str) -> str:
         return re.sub(r"<[^>]+>", " ", html)
 
 
-def extract_mda(html: str, max_chars: int = 30000) -> str:
+def extract_mda(html: str, form_type: str = "10-Q", max_chars: int = 30000) -> str:
     # Remove table HTML — keep narrative prose only, skip financial data tables
     html = re.sub(r'<table[\s>].*?</table>', ' ', html, flags=re.IGNORECASE | re.DOTALL)
     text = _strip_html(html)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    start_pats = [
-        r"(?i)ITEM\s*2[\.\:\-\u2014\s]+MANAGEMENT[''\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
-        r"(?i)ITEM\s*2\b.{0,10}MANAGEMENT.{0,60}DISCUSSION",
-        r"(?i)Management[''\s]*s\s+Discussion\s+and\s+Analysis\s+of\s+Financial\s+Condition",
-        r"(?i)MANAGEMENT[''\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
-        r"(?i)ITEM\s*2\b",
-    ]
+    # 10-K: MD&A is under Item 7; 10-Q: MD&A is under Item 2
+    if form_type == "10-K":
+        start_pats = [
+            r"(?i)ITEM\s*7[\.\:\-\u2014\s]+MANAGEMENT[\u2019'\u2018'\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
+            r"(?i)ITEM\s*7\b.{0,10}MANAGEMENT.{0,60}DISCUSSION",
+            r"(?i)ITEM\s*7[\.\:\-\u2014\s]+MD&A",
+            r"(?i)ITEM\s*7\b",
+        ]
+        end_pats = [
+            r"(?i)ITEM\s*7A[\.\:\-\u2014\s]+QUANTITATIVE",
+            r"(?i)ITEM\s*7A\b",
+            r"(?i)ITEM\s*8[\.\:\-\u2014\s]+FINANCIAL\s+STATEMENTS",
+            r"(?i)\bITEM\s*8\b",
+        ]
+    else:
+        start_pats = [
+            r"(?i)ITEM\s*2[\.\:\-\u2014\s]+MANAGEMENT[\u2019'\u2018'\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
+            r"(?i)ITEM\s*2\b.{0,10}MANAGEMENT.{0,60}DISCUSSION",
+            r"(?i)Management[\u2019'\u2018'\s]*s\s+Discussion\s+and\s+Analysis\s+of\s+Financial\s+Condition",
+            r"(?i)MANAGEMENT[\u2019'\u2018'\s]*S\s+DISCUSSION\s+AND\s+ANALYSIS",
+            r"(?i)ITEM\s*2\b",
+        ]
+        end_pats = [
+            r"(?i)ITEM\s*3[\.\:\-\u2014\s]+QUANTITATIVE",
+            r"(?i)ITEM\s*3[\.\:\-\u2014\s]+MARKET\s+RISK",
+            r"(?i)\bITEM\s*3[\.\:\-\u2014\s]",
+            r"(?i)\bITEM\s*4\b",
+            r"(?i)PART\s+II\b",
+        ]
+
     start = -1
     for pat in start_pats:
         m = re.search(pat, text)
@@ -285,13 +308,6 @@ def extract_mda(html: str, max_chars: int = 30000) -> str:
     if start == -1:
         return text[:max_chars].strip()
 
-    end_pats = [
-        r"(?i)ITEM\s*3[\.\:\-\u2014\s]+QUANTITATIVE",
-        r"(?i)ITEM\s*3[\.\:\-\u2014\s]+MARKET\s+RISK",
-        r"(?i)\bITEM\s*3[\.\:\-\u2014\s]",
-        r"(?i)\bITEM\s*4\b",
-        r"(?i)PART\s+II\b",
-    ]
     tail = text[start + 200:]
     end_offset = len(tail)
     for pat in end_pats:
@@ -301,14 +317,16 @@ def extract_mda(html: str, max_chars: int = 30000) -> str:
 
     mda = text[start: start + 200 + end_offset].strip()
     return mda[:max_chars]
-def fetch_mda(cik: str, accession: str, primary_doc: str) -> str:
+
+
+def fetch_mda(cik: str, accession: str, primary_doc: str, form_type: str = "10-Q") -> str:
     cik_int    = int(cik)
     acc_nodash = accession.replace("-", "")
     url = EDGAR_ARCHIVES.format(cik_int=cik_int, acc_nodash=acc_nodash, doc=primary_doc)
     html = _get(url, as_text=True)
     if not html:
         return "（MD&Aテキストを取得できませんでした。SECのネットワーク制限またはファイル形式の問題の可能性があります。）"
-    return extract_mda(html)
+    return extract_mda(html, form_type=form_type)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # XBRL Fact Fetching & Extraction
@@ -1307,7 +1325,12 @@ for k in ("filings", "last_ticker", "cik", "company_name", "facts"):
     if k not in st.session_state:
         st.session_state[k] = None
 
-st.markdown("# 📊 SEC EDGAR 財務分析ツール")
+st.markdown("# 📊 Par Pacific Holdings — SEC EDGAR 財務分析ツール")
+st.caption(
+    "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
+    "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
+    "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
+)
 st.markdown("米国上場企業のティッカーと対象決算期を選択して「財務分析を実行」してください。")
 st.markdown("---")
 
@@ -1444,7 +1467,8 @@ elif st.session_state.get("filings"):
             pl  = extract_pl(facts, period, form_type=selected.get("form", "10-Q"),
                              quarter_num=_q_num)
             bs  = extract_bs(facts, period)
-            mda = fetch_mda(cik, selected["accession"], selected["primary_doc"])
+            mda = fetch_mda(cik, selected["accession"], selected["primary_doc"],
+                            form_type=selected.get("form", "10-Q"))
 
         ratios  = compute_ratios(bs)
         verdict, v_hex, v_emoji = risk_verdict(ratios)
