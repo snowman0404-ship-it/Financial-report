@@ -437,10 +437,13 @@ def build_bs_df(bs: dict) -> pd.DataFrame:
             "_pct": pct, "_is_cost": is_liab, "_tag": tag,
         })
     # Other Current Assets (derived)
-    ca   = _m(bs.get("CurrentAssets", {}).get("current", (None,))[0])
-    ca_p = _m(bs.get("CurrentAssets", {}).get("prior",   (None,))[0])
-    cash = _m(bs.get("Cash",          {}).get("current", (None,))[0])
-    cashp= _m(bs.get("Cash",          {}).get("prior",   (None,))[0])
+    def _bsv(key, which):
+        v = bs.get(key, {}).get(which)
+        return _m(v[0]) if v is not None else None
+    ca   = _bsv("CurrentAssets", "current")
+    ca_p = _bsv("CurrentAssets", "prior")
+    cash = _bsv("Cash", "current")
+    cashp= _bsv("Cash", "prior")
     oca  = (ca - cash)     if (ca is not None and cash is not None)   else None
     ocap = (ca_p - cashp)  if (ca_p is not None and cashp is not None) else None
     oca_d= (oca - ocap)   if (oca is not None and ocap is not None)  else None
@@ -502,8 +505,12 @@ def _style_df(df: pd.DataFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_ratios(bs: dict) -> dict:
-    def cv(k): return _m(bs.get(k, {}).get("current", (None,))[0])
-    def pv(k): return _m(bs.get(k, {}).get("prior",   (None,))[0])
+    def cv(k):
+        v = bs.get(k, {}).get("current")
+        return _m(v[0]) if v is not None else None
+    def pv(k):
+        v = bs.get(k, {}).get("prior")
+        return _m(v[0]) if v is not None else None
 
     ca, ca_p = cv("CurrentAssets"),      pv("CurrentAssets")
     cl, cl_p = cv("CurrentLiabilities"), pv("CurrentLiabilities")
