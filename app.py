@@ -16,6 +16,108 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+try:
+    import yfinance as yf  # noqa: F401  (imported lazily in helpers)
+except ImportError:
+    yf = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# yfinance Helpers (gracefully degrade when Yahoo Finance is blocked)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _search_tickers(query: str) -> list:
+    """Search for tickers using yfinance. Returns list of {ticker, name} dicts."""
+    try:
+        import yfinance as yf
+        results = yf.Search(query, max_results=8)
+        out = []
+        for q in results.quotes:
+            sym = q.get("symbol", "")
+            name = q.get("shortname") or q.get("longname") or sym
+            if sym and "." not in sym:  # skip non-US tickers (e.g. 7203.T)
+                out.append({"ticker": sym, "name": name})
+        return out
+    except Exception:
+        return []
+
+
+def _get_stock_history(ticker: str):
+    """Get 5-year daily close prices via yfinance."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(ticker).history(period="5y", interval="1d")
+        if df.empty:
+            return None
+        return df[["Close"]].rename(columns={"Close": f"{ticker} 終値 (USD)"})
+    except Exception:
+        return None
+
+
+def _get_yf_info(ticker: str) -> dict:
+    """Get key valuation metrics from yfinance."""
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        return {
+            "price":      info.get("currentPrice") or info.get("regularMarketPrice"),
+            "pe":         info.get("trailingPE"),
+            "pb":         info.get("priceToBook"),
+            "market_cap": info.get("marketCap"),
+            "shares":     info.get("sharesOutstanding"),
+        }
+    except Exception:
+        return {}
+
+
+def compute_altman_z(bs: dict, pl: dict):
+    """Compute Altman Z-Score from EDGAR XBRL data.
+    Uses Z' model (book value) since market cap may be unavailable.
+    Z' = 0.717*X1 + 0.847*X2 + 3.107*X3 + 0.420*X4 + 0.998*X5
+    """
+    def _cv(k):
+        v = bs.get(k, {}).get("current")
+        return float(v[0]) / 1e6 if v and v[0] is not None else None
+
+    ca  = _cv("CurrentAssets")
+    cl  = _cv("CurrentLiabilities")
+    nca = _cv("NonCurrentAssets")
+    eq  = _cv("StockholdersEquity")
+    ltl = _cv("LongTermLiabilities")
+
+    if None in (ca, cl, nca, eq, ltl):
+        return None
+
+    ta  = (ca or 0) + (nca or 0)
+    tl  = (cl or 0) + (ltl or 0)
+    wc  = (ca or 0) - (cl or 0)
+
+    rev_d = pl.get("Revenues", {}).get("current")
+    op_d  = pl.get("OperatingIncomeLoss", {}).get("current")
+    rev = float(rev_d[0]) / 1e6 if rev_d and rev_d[0] is not None else None
+    op  = float(op_d[0]) / 1e6  if op_d and op_d[0] is not None else None
+
+    if ta == 0 or tl == 0 or None in (rev, op):
+        return None
+
+    x1 = wc / ta
+    x2 = (eq or 0) / ta   # approximation: RE ≈ Equity
+    x3 = op / ta
+    x4 = (eq or 0) / tl   # book equity / total liabilities
+    x5 = rev / ta
+
+    z = 0.717*x1 + 0.847*x2 + 3.107*x3 + 0.420*x4 + 0.998*x5
+
+    if z > 2.99:
+        zone, color, emoji = "安全圏 / Safe Zone", "#D2FFD2", "🟢"
+    elif z > 1.81:
+        zone, color, emoji = "グレーゾーン / Grey Zone", "#FFFACD", "🟡"
+    else:
+        zone, color, emoji = "危険圏 / Distress Zone", "#FFD2D2", "🔴"
+
+    return {"z": z, "zone": zone, "color": color, "emoji": emoji,
+            "x1": x1, "x2": x2, "x3": x3, "x4": x4, "x5": x5}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants & Tag Maps
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +241,28 @@ PL_LABELS = {
     "OperatingIncomeLoss": "営業利益 / Operating Income",
     "InterestExpense":     "営業外費用 / Total Other Expense, net",
     "IncomeLossBeforeTax": "税引前利益 / Income Before Tax",
+    "NetIncomeLoss":       "純利益 / Net Income",
+}
+
+SIMPLE_PL_TAGS = {
+    "Revenues": [
+        "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax",
+    ],
+    "GrossProfit": ["GrossProfit"],
+    "OperatingIncomeLoss": [
+        "OperatingIncomeLoss",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    ],
+    "NetIncomeLoss": [
+        "NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic",
+    ],
+}
+
+SIMPLE_PL_LABELS = {
+    "Revenues":            "売上高 / Revenues",
+    "GrossProfit":         "売上総利益 / Gross Profit",
+    "OperatingIncomeLoss": "営業利益 / Operating Income",
     "NetIncomeLoss":       "純利益 / Net Income",
 }
 BS_LABELS = {
@@ -493,11 +617,15 @@ _Q_PERIOD_LABELS = {1: "3ヶ月", 2: "6ヶ月累積", 3: "9ヶ月累積", 4: "�
 
 
 def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "10-Q",
-               quarter_num: int = 1) -> dict:
+               quarter_num: int = 1, is_parr: bool = False) -> dict:
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
     effective_q = 4 if (form_type == "10-K") else quarter_num
     result = {}
-    for metric, candidates in PL_TAGS.items():
+
+    # Choose tag set based on company type
+    tag_set = PL_TAGS if is_parr else SIMPLE_PL_TAGS
+
+    for metric, candidates in tag_set.items():
         tag, _recs, period_recs = _best_ytd_tag(facts, candidates, effective_q)
         period_recs = _dedup_latest(period_recs, 30)
         current = prior = None
@@ -514,19 +642,20 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
                     prior = (prior_rec.get("val"), prior_rec["end"], tag)
         result[metric] = {"current": current, "prior": prior}
 
-    # Derive OperatingExpenses = Revenues − OperatingIncomeLoss per period independently.
-    # Runs for each period where the XBRL tags above yielded no value.
-    rev = result.get("Revenues", {})
-    opi = result.get("OperatingIncomeLoss", {})
-    for which in ("current", "prior"):
-        t = result.get("OperatingExpenses", {}).get(which)
-        if t is None or t[0] is None:
-            r_t = rev.get(which)
-            o_t = opi.get(which)
-            if r_t and o_t and r_t[0] is not None and o_t[0] is not None:
-                result.setdefault("OperatingExpenses", {})[which] = (
-                    r_t[0] - o_t[0], r_t[1], "※導出値: Revenues − OperatingIncomeLoss"
-                )
+    if is_parr:
+        # Derive OperatingExpenses = Revenues − OperatingIncomeLoss per period independently.
+        # Runs for each period where the XBRL tags above yielded no value.
+        rev = result.get("Revenues", {})
+        opi = result.get("OperatingIncomeLoss", {})
+        for which in ("current", "prior"):
+            t = result.get("OperatingExpenses", {}).get(which)
+            if t is None or t[0] is None:
+                r_t = rev.get(which)
+                o_t = opi.get(which)
+                if r_t and o_t and r_t[0] is not None and o_t[0] is not None:
+                    result.setdefault("OperatingExpenses", {})[which] = (
+                        r_t[0] - o_t[0], r_t[1], "※導出値: Revenues − OperatingIncomeLoss"
+                    )
 
     return result
 
@@ -628,10 +757,10 @@ def _pct_label(pct, cur, pri, is_bad_if_high: bool) -> str:
     # Sign-change cases
     if cur is not None and pri is not None:
         if pri < 0 and cur > 0:
-            return "黒字転換" if not is_bad_if_high else f"{pct:+.1%}"
+            return "黒字転換" if not is_bad_if_high else f"{pct:+.0%}"
         if pri > 0 and cur < 0:
-            return "赤字転落" if not is_bad_if_high else f"{pct:+.1%}"
-    return f"{pct:+.1%}"
+            return "赤字転落" if not is_bad_if_high else f"{pct:+.0%}"
+    return f"{pct:+.0%}"
 
 
 def _alert(pct, cur, pri, is_bad_if_high: bool) -> str:
@@ -648,19 +777,26 @@ def _alert(pct, cur, pri, is_bad_if_high: bool) -> str:
     return "⚠️ -20%↓ 急減" if pct < -0.20 else ("✅ +20%↑ 成長" if pct > 0.20 else "✅ 正常")
 
 
-def build_pl_df(pl: dict) -> pd.DataFrame:
+
+
+
+def build_pl_df(pl: dict, labels: dict | None = None) -> pd.DataFrame:
     # ① Determine canonical period dates (most common across metrics)
     canon_cur = _canon_date(pl, "current")
     canon_pri = _canon_date(pl, "prior")
     cur_col   = f"当期 ({canon_cur})\n[USD M]"
     pri_col   = f"前期 ({canon_pri})\n[USD M]"
 
+    use_labels = labels if labels is not None else PL_LABELS
     rows = []
-    for key, label in PL_LABELS.items():
+    for key, label in use_labels.items():
         data = pl.get(key, {})
         # ② Only accept values whose period aligns with the canonical date
         cur = _safe_val(data, "current") if _period_ok(data, "current", canon_cur) else None
         pri = _safe_val(data, "prior")   if _period_ok(data, "prior",   canon_pri) else None
+        # Round to integer millions
+        cur = round(cur) if cur is not None else None
+        pri = round(pri) if pri is not None else None
         tag = data["current"][2]         if data.get("current") else "—"
 
         delta = (cur - pri) if (cur is not None and pri is not None) else None
@@ -685,7 +821,8 @@ def build_bs_df(bs: dict) -> pd.DataFrame:
 
     def _bv(k, w):
         data = bs.get(k, {})
-        return _safe_val(data, w) if _period_ok(data, w, canon_cur if w == "current" else canon_pri) else None
+        v = _safe_val(data, w) if _period_ok(data, w, canon_cur if w == "current" else canon_pri) else None
+        return round(v) if v is not None else None
 
     def _item(key, label, is_liab):
         data   = bs.get(key, {})
@@ -798,7 +935,7 @@ def _style_df(df: pd.DataFrame):
     def fmt_usd(v):
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return "N/A"
-        return f"{v:,.1f}"
+        return f"{round(v):,}"
 
     fmt       = {c: fmt_usd for c in display_cols if "USD M" in c or "差額" in c}
     right_cols = [c for c in display_cols if c not in ("項目 / Metric", "変化率 %")]
