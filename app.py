@@ -1355,15 +1355,15 @@ if demo_btn:
     k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
     k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
     k6.metric("現金残高", _ms(ratios["cash_cur"]))
-    with st.expander("📖 各指標の見方・チェック理由"):
+    with st.expander("📖 各指標の見方・チェック理由", expanded=False):
         st.markdown("""
 | 指標 | 見方・チェック理由 |
-|------|----------------|
-| 流動比率 | 短期の支払い能力。1.0未満＝黒字倒産リスク警戒。1.5以上が健全目安。 |
-| 自己資本比率 | 中長期の倒産リスク（企業の頑丈さ）。エネルギーセクターは30%以上が健全目安。 |
-| 現金残高 & QoQ | 体力ゲージ。QoQ −20%以上の急減は警告シグナル。 |
-| 流動負債 QoQ | 目の前の支払い増減。現金減少局面での激増＝デッドクロスリスク。 |
-| 株主資本 QoQ | 基礎体力。マイナスは本業赤字または過剰配当・自社株買いのサイン。 |
+|------|------------------|
+| **流動比率** | 短期の支払い能力を測定。**1.0未満**は1年以内の債務に対して現金化できる資産が不足＝黒字倒産リスクの警戒サイン。 |
+| **自己資本比率** | 中長期の倒産リスク（企業の頑丈さ）を測定。市況変動が激しいエネルギーセクターでは**30%以上**が健全目安。 |
+| **現金残高 & 現金QoQ** | 企業のリアルな体力ゲージ。QoQで**20%以上急減**している場合は、手元資金が急速に流出している警告シグナル。 |
+| **流動負債 QoQ** | 目の前に迫る支払いの増減。現金が減っている局面でここが激増＝短期資金繰りの**デッドクロス**リスク。 |
+| **株主資本 QoQ** | 基礎体力の増減。マイナスは本業赤字 or 身の丈に合わない配当・自社株買いで会社が細っているサイン。 |
 """)
     _show_composite_alerts(compute_alerts(pl, bs))
     st.markdown("---")
@@ -1373,7 +1373,7 @@ if demo_btn:
     st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
     st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-    st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=310)
+    st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=280)
 
     st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
     st.caption("以下のテキストをそのままClaude等のAIにコピー＆ペーストして要約・分析できます。")
@@ -1447,15 +1447,15 @@ elif st.session_state.get("filings"):
         k4.metric("流動負債 QoQ", _ps(ratios["cl_qoq"]))
         k5.metric("株主資本 QoQ", _ps(ratios["eq_qoq"]))
         k6.metric("現金残高", _ms(ratios["cash_cur"]))
-        with st.expander("📖 各指標の見方・チェック理由"):
+        with st.expander("📖 各指標の見方・チェック理由", expanded=False):
             st.markdown("""
 | 指標 | 見方・チェック理由 |
-|------|----------------|
-| 流動比率 | 短期の支払い能力。1.0未満＝黒字倒産リスク警戒。1.5以上が健全目安。 |
-| 自己資本比率 | 中長期の倒産リスク（企業の頑丈さ）。エネルギーセクターは30%以上が健全目安。 |
-| 現金残高 & QoQ | 体力ゲージ。QoQ −20%以上の急減は警告シグナル。 |
-| 流動負債 QoQ | 目の前の支払い増減。現金減少局面での激増＝デッドクロスリスク。 |
-| 株主資本 QoQ | 基礎体力。マイナスは本業赤字または過剰配当・自社株買いのサイン。 |
+|------|------------------|
+| **流動比率** | 短期の支払い能力を測定。**1.0未満**は1年以内の債務に対して現金化できる資産が不足＝黒字倒産リスクの警戒サイン。 |
+| **自己資本比率** | 中長期の倒産リスク（企業の頑丈さ）を測定。市況変動が激しいエネルギーセクターでは**30%以上**が健全目安。 |
+| **現金残高 & 現金QoQ** | 企業のリアルな体力ゲージ。QoQで**20%以上急減**している場合は、手元資金が急速に流出している警告シグナル。 |
+| **流動負債 QoQ** | 目の前に迫る支払いの増減。現金が減っている局面でここが激増＝短期資金繰りの**デッドクロス**リスク。 |
+| **株主資本 QoQ** | 基礎体力の増減。マイナスは本業赤字 or 身の丈に合わない配当・自社株買いで会社が細っているサイン。 |
 """)
         _show_composite_alerts(compute_alerts(pl, bs))
         st.markdown("---")
@@ -1465,7 +1465,7 @@ elif st.session_state.get("filings"):
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
-        st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=310)
+        st.dataframe(_style_df(build_bs_df(bs)), width="stretch", height=280)
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
