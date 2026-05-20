@@ -53,12 +53,19 @@ def _get_stock_history(ticker: str):
         return None
 
 
-def _get_yf_info(ticker: str) -> dict:
-    """Get key valuation metrics from yfinance."""
+def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
+    """Compute PER/PBR with 3-level fallback.
+
+    1. yfinance info direct fields (trailingPE, priceToBook, EPS, bookValue)
+    2. yfinance EPS/bookValue fields + price from history()
+    3. EDGAR annual 10-K net income / equity + price from history()
+
+    Price is always fetched from history() first (same path as the stock chart,
+    more reliable than info["currentPrice"] which can be None when info fails).
+    """
     import math
 
     def _f(v):
-        """Return float if valid and not nan, else None (allows negative)."""
         try:
             f = float(v)
             return None if math.isnan(f) else f
@@ -66,44 +73,93 @@ def _get_yf_info(ticker: str) -> dict:
             return None
 
     def _fpos(v):
-        """Return float only if positive."""
         f = _f(v)
         return f if f and f > 0 else None
 
     try:
         import yfinance as yf
-        info = yf.Ticker(ticker).info
+    except ImportError:
+        return {}
 
+    # ── Price via history() — same endpoint that powers the stock chart ──
+    price = None
+    try:
+        h = yf.Ticker(ticker).history(period="5d")
+        if not h.empty:
+            price = float(h["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    # ── yfinance info for fundamental fields ──
+    info = {}
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        pass
+
+    if not price:
         price = _fpos(info.get("currentPrice")) or _fpos(info.get("regularMarketPrice"))
 
-        # PER: trailingPE direct → price/trailingEps → forwardPE → price/forwardEps
-        pe, pe_label = None, "PER"
-        if _fpos(info.get("trailingPE")):
-            pe, pe_label = _fpos(info.get("trailingPE")), "PER（実績）"
-        elif price and _f(info.get("trailingEps")) and _f(info.get("trailingEps")) > 0:
-            pe, pe_label = price / _f(info.get("trailingEps")), "PER（実績）"
-        elif _fpos(info.get("forwardPE")):
-            pe, pe_label = _fpos(info.get("forwardPE")), "PER（予想）"
-        elif price and _f(info.get("forwardEps")) and _f(info.get("forwardEps")) > 0:
-            pe, pe_label = price / _f(info.get("forwardEps")), "PER（予想）"
+    # PER — yfinance: direct → EPS calculation → forward
+    pe, pe_label = None, "PER"
+    t_pe  = _fpos(info.get("trailingPE"))
+    t_eps = _f(info.get("trailingEps"))
+    f_pe  = _fpos(info.get("forwardPE"))
+    f_eps = _f(info.get("forwardEps"))
+    if t_pe:
+        pe, pe_label = t_pe, "PER（実績）"
+    elif price and t_eps and t_eps > 0:
+        pe, pe_label = price / t_eps, "PER（実績）"
+    elif f_pe:
+        pe, pe_label = f_pe, "PER（予想）"
+    elif price and f_eps and f_eps > 0:
+        pe, pe_label = price / f_eps, "PER（予想）"
 
-        # PBR: priceToBook direct → price/bookValue(per share)
-        pb = _fpos(info.get("priceToBook"))
-        if not pb and price:
-            bv = _f(info.get("bookValue"))   # per-share book value
-            if bv and bv > 0:
-                pb = price / bv
+    # PBR — yfinance: direct → price / bookValue per share
+    pb = _fpos(info.get("priceToBook"))
+    if not pb and price:
+        bv = _f(info.get("bookValue"))
+        if bv and bv > 0:
+            pb = price / bv
 
-        return {
-            "price":      price,
-            "pe":         pe,
-            "pe_label":   pe_label,
-            "pb":         pb,
-            "market_cap": _fpos(info.get("marketCap")),
-            "shares":     _fpos(info.get("sharesOutstanding")),
-        }
-    except Exception:
-        return {}
+    # ── EDGAR fallback (only when yfinance fields unavailable) ──
+    if price and (not pe or not pb):
+        # Shares outstanding from EDGAR facts
+        shares = None
+        for _ns in ("dei", "us-gaap"):
+            for _tag in ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"):
+                _sh = facts.get(_ns, {}).get(_tag, {}).get("units", {}).get("shares", [])
+                if _sh:
+                    _sh = sorted(_sh, key=lambda r: r.get("end", ""), reverse=True)
+                    shares = _fpos(_sh[0].get("val"))
+                    if shares:
+                        break
+            if shares:
+                break
+
+        if shares:
+            mc = price * shares  # market cap in dollars
+
+            if not pb:
+                _eq = bs.get("StockholdersEquity", {}).get("current")
+                eq = _f(_eq[0]) if _eq and _eq[0] is not None else None
+                if eq and eq > 0:
+                    pb = mc / eq
+
+            if not pe:
+                _ni_all = facts.get("us-gaap", {}).get("NetIncomeLoss", {}) \
+                               .get("units", {}).get("USD", [])
+                _annual = sorted(
+                    [r for r in _ni_all
+                     if r.get("form") in ("10-K", "10-K/A") and r.get("val") is not None],
+                    key=lambda r: r.get("end", ""), reverse=True
+                )
+                if _annual:
+                    ni = _f(_annual[0].get("val"))
+                    if ni and ni > 0:
+                        pe, pe_label = mc / ni, "PER（実績）"
+
+    return {"pe": pe, "pe_label": pe_label, "pb": pb}
 
 
 def compute_altman_z(bs: dict, pl: dict):
@@ -1814,12 +1870,12 @@ if st.session_state.get("filings"):
 
         with col_val:
             st.markdown("### 💹 バリュエーション指標")
-            yf_info = _get_yf_info(ticker)
-            z_data = compute_altman_z(bs, pl)
+            val_info = _compute_valuation(ticker, facts, bs)
+            z_data   = compute_altman_z(bs, pl)
 
-            pe       = yf_info.get("pe")
-            pe_label = yf_info.get("pe_label", "PER（株価収益率）")
-            pb       = yf_info.get("pb")
+            pe       = val_info.get("pe")
+            pe_label = val_info.get("pe_label", "PER（株価収益率）")
+            pb       = val_info.get("pb")
 
             st.metric(pe_label, f"{pe:.1f}倍" if pe else "N/A")
             st.metric("PBR（株価純資産倍率）", f"{pb:.1f}倍" if pb else "N/A")
