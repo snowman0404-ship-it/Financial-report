@@ -1666,9 +1666,9 @@ for k in ("filings", "last_ticker", "cik", "company_name", "facts", "search_resu
 
 st.markdown("# 📊 Par Pacific Holdings — SEC EDGAR 財務分析ツール")
 st.caption(
-    "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
-    "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
-    "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
+    "※ 本ツールはPar Pacific Holdingsを基準として設計されています。"
+    "他社のP/Lは売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
+    "一部項目が欠損またはズレが生じる可能性があります。他社データは原本データでバックチェックください。"
 )
 st.markdown("米国上場企業のティッカーと対象決算期を選択して「財務分析を実行」してください。")
 st.markdown("---")
