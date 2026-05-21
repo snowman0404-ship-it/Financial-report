@@ -44,26 +44,42 @@ def _search_tickers(query: str) -> list:
 def _get_chart_data(ticker: str):
     """Fetch 5Y daily close for ticker and optionally S&P500 (^GSPC).
     Returns (stock_df, sp500_df_or_None). stock_df is None only on total failure.
-    S&P500 is fetched independently; failure returns None for that series only.
     """
-    try:
-        import yfinance as yf
-        stock = yf.Ticker(ticker).history(period="5y", interval="1d")[["Close"]]
-        if stock.empty:
-            return None, None
-    except Exception:
+    import pandas as pd
+
+    def _fetch(sym: str):
+        """Return a tz-naive daily Close DataFrame, or None on any failure."""
+        try:
+            import yfinance as yf
+            df = yf.Ticker(sym).history(period="5y", interval="1d")
+            if df.empty:
+                return None
+            # Case-insensitive column search (yfinance may vary by version)
+            col = next((c for c in df.columns if c.lower() == "close"), None)
+            if col is None:
+                return None
+            s = df[[col]].copy()
+            s.columns = ["Close"]
+            # Normalise to tz-naive date index so both series align safely
+            if getattr(s.index, "tzinfo", None) is not None:
+                s.index = s.index.tz_convert("UTC").tz_localize(None)
+            s.index = pd.to_datetime(s.index.date)
+            return s
+        except Exception:
+            return None
+
+    stock = _fetch(ticker)
+    if stock is None or stock.empty:
         return None, None
 
-    sp500 = None
-    try:
-        import yfinance as yf
-        _sp = yf.Ticker("^GSPC").history(period="5y", interval="1d")[["Close"]]
-        if not _sp.empty:
-            start = max(stock.index[0], _sp.index[0])
+    sp500 = _fetch("^GSPC")
+    if sp500 is not None and not sp500.empty:
+        try:
+            start = max(stock.index[0], sp500.index[0])
             stock = stock[stock.index >= start]
-            sp500 = _sp[_sp.index >= start]
-    except Exception:
-        pass
+            sp500 = sp500[sp500.index >= start]
+        except Exception:
+            sp500 = None  # alignment failed — show stock only
 
     return stock, sp500
 
