@@ -112,7 +112,10 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
         return f if f and f > 0 else None
 
     def _ttm_eps(eps_records: list) -> float | None:
-        """Sum 4 most recent individual quarterly (~3-month) EPS for TTM."""
+        """Sum 4 most recent individual quarterly EPS for TTM.
+        Uses a wider window (60-120 days) to handle fiscal quarters that
+        don't fall in the standard 80-100 day range (e.g. Tesla Q4).
+        """
         quarterly = []
         for r in eps_records:
             s, e, v = r.get("start"), r.get("end"), r.get("val")
@@ -120,7 +123,7 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
                 continue
             try:
                 d = (_dt.strptime(e, "%Y-%m-%d") - _dt.strptime(s, "%Y-%m-%d")).days
-                if 80 <= d <= 100:          # individual quarter only
+                if 60 <= d <= 120:          # wider window: quarter only (not semi-annual)
                     quarterly.append((e, _f(v)))
             except (ValueError, TypeError):
                 pass
@@ -163,8 +166,21 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
     pe, pe_label = None, "PER"
     pb = None
 
-    # ── PER: EDGAR TTM diluted EPS is primary (matches Yahoo Finance TTM method)
-    if price:
+    # ── PER ──────────────────────────────────────────────────────────────────
+    # Priority 1: yfinance trailingEps (= Yahoo Finance's own TTM EPS value)
+    t_eps = _f(info.get("trailingEps"))
+    t_pe  = _fpos(info.get("trailingPE"))
+    f_pe  = _fpos(info.get("forwardPE"))
+    f_eps = _f(info.get("forwardEps"))
+
+    if price and t_eps and t_eps > 0:
+        # price / trailingEps is most accurate — same as Yahoo Finance TTM PER
+        pe, pe_label = price / t_eps, "PER（実績）"
+    elif t_pe:
+        pe, pe_label = t_pe, "PER（実績）"
+
+    # Priority 2: EDGAR TTM diluted EPS (fallback when yfinance returns no data)
+    if not pe and price:
         for _eps_tag in ("EarningsPerShareDiluted", "EarningsPerShareBasic"):
             _eps_recs = facts.get("facts", {}).get("us-gaap", {}) \
                              .get(_eps_tag, {}).get("units", {}).get("USD/shares", [])
@@ -174,7 +190,7 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
             if ttm and ttm > 0:
                 pe, pe_label = price / ttm, "PER（実績）"
                 break
-            # Fallback to most recent annual 10-K EPS if quarterly data unavailable
+            # Annual 10-K EPS as last resort
             _annual = sorted(
                 [r for r in _eps_recs
                  if r.get("form") in ("10-K", "10-K/A") and r.get("val") is not None],
@@ -186,29 +202,22 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
                     pe, pe_label = price / eps_val, "PER（実績）"
                     break
 
-    # If EDGAR EPS unavailable, fall back to yfinance info fields
+    # Forward PER only when no trailing data at all
     if not pe:
-        t_pe  = _fpos(info.get("trailingPE"))
-        t_eps = _f(info.get("trailingEps"))
-        f_pe  = _fpos(info.get("forwardPE"))
-        f_eps = _f(info.get("forwardEps"))
-        if t_pe:
-            pe, pe_label = t_pe, "PER（実績）"
-        elif price and t_eps and t_eps > 0:
-            pe, pe_label = price / t_eps, "PER（実績）"
-        elif f_pe:
+        if f_pe:
             pe, pe_label = f_pe, "PER（予想）"
         elif price and f_eps and f_eps > 0:
             pe, pe_label = price / f_eps, "PER（予想）"
 
-    # ── PBR: yfinance priceToBook is primary (direct Yahoo Finance field)
+    # ── PBR ──────────────────────────────────────────────────────────────────
+    # Priority 1: yfinance priceToBook (= Yahoo Finance's own PBR value)
     pb = _fpos(info.get("priceToBook"))
     if not pb and price:
         bv = _f(info.get("bookValue"))
         if bv and bv > 0:
             pb = price / bv
 
-    # EDGAR fallback for PBR
+    # Priority 2: EDGAR equity / shares (fallback)
     if not pb and price:
         shares = None
         for _ns in ("dei", "us-gaap"):
