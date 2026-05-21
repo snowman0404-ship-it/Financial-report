@@ -167,17 +167,18 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
     pb = None
 
     # ── PER ──────────────────────────────────────────────────────────────────
-    # Priority 1: yfinance trailingEps (= Yahoo Finance's own TTM EPS value)
-    t_eps = _f(info.get("trailingEps"))
+    # Priority 1: trailingPE direct (= Yahoo Finance's displayed PE value)
+    # This is the most reliable match — avoids GAAP EPS distortions from
+    # inventory adjustments, impairments, or one-time items (e.g. PSX, PARR).
     t_pe  = _fpos(info.get("trailingPE"))
+    t_eps = _f(info.get("trailingEps"))
     f_pe  = _fpos(info.get("forwardPE"))
     f_eps = _f(info.get("forwardEps"))
 
-    if price and t_eps and t_eps > 0:
-        # price / trailingEps is most accurate — same as Yahoo Finance TTM PER
-        pe, pe_label = price / t_eps, "PER（実績）"
-    elif t_pe:
+    if t_pe:
         pe, pe_label = t_pe, "PER（実績）"
+    elif price and t_eps and t_eps > 0:
+        pe, pe_label = price / t_eps, "PER（実績）"
 
     # Priority 2: EDGAR TTM diluted EPS (fallback when yfinance returns no data)
     if not pe and price:
