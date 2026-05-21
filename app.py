@@ -160,31 +160,56 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
     if not price:
         price = _fpos(info.get("currentPrice")) or _fpos(info.get("regularMarketPrice"))
 
-    # PER — yfinance first (trailingPE → trailingEps → forwardPE → forwardEps)
     pe, pe_label = None, "PER"
-    t_pe  = _fpos(info.get("trailingPE"))
-    t_eps = _f(info.get("trailingEps"))
-    f_pe  = _fpos(info.get("forwardPE"))
-    f_eps = _f(info.get("forwardEps"))
-    if t_pe:
-        pe, pe_label = t_pe, "PER（実績）"
-    elif price and t_eps and t_eps > 0:
-        pe, pe_label = price / t_eps, "PER（実績）"
-    elif f_pe:
-        pe, pe_label = f_pe, "PER（予想）"
-    elif price and f_eps and f_eps > 0:
-        pe, pe_label = price / f_eps, "PER（予想）"
+    pb = None
 
-    # PBR — yfinance first (priceToBook → price/bookValue per share)
+    # ── PER: EDGAR TTM diluted EPS is primary (matches Yahoo Finance TTM method)
+    if price:
+        for _eps_tag in ("EarningsPerShareDiluted", "EarningsPerShareBasic"):
+            _eps_recs = facts.get("facts", {}).get("us-gaap", {}) \
+                             .get(_eps_tag, {}).get("units", {}).get("USD/shares", [])
+            if not _eps_recs:
+                continue
+            ttm = _ttm_eps(_eps_recs)
+            if ttm and ttm > 0:
+                pe, pe_label = price / ttm, "PER（実績）"
+                break
+            # Fallback to most recent annual 10-K EPS if quarterly data unavailable
+            _annual = sorted(
+                [r for r in _eps_recs
+                 if r.get("form") in ("10-K", "10-K/A") and r.get("val") is not None],
+                key=lambda r: r.get("end", ""), reverse=True
+            )
+            if _annual:
+                eps_val = _f(_annual[0].get("val"))
+                if eps_val and eps_val > 0:
+                    pe, pe_label = price / eps_val, "PER（実績）"
+                    break
+
+    # If EDGAR EPS unavailable, fall back to yfinance info fields
+    if not pe:
+        t_pe  = _fpos(info.get("trailingPE"))
+        t_eps = _f(info.get("trailingEps"))
+        f_pe  = _fpos(info.get("forwardPE"))
+        f_eps = _f(info.get("forwardEps"))
+        if t_pe:
+            pe, pe_label = t_pe, "PER（実績）"
+        elif price and t_eps and t_eps > 0:
+            pe, pe_label = price / t_eps, "PER（実績）"
+        elif f_pe:
+            pe, pe_label = f_pe, "PER（予想）"
+        elif price and f_eps and f_eps > 0:
+            pe, pe_label = price / f_eps, "PER（予想）"
+
+    # ── PBR: yfinance priceToBook is primary (direct Yahoo Finance field)
     pb = _fpos(info.get("priceToBook"))
     if not pb and price:
         bv = _f(info.get("bookValue"))
         if bv and bv > 0:
             pb = price / bv
 
-    # EDGAR fallback — only when yfinance fields are unavailable
-    if price and (not pe or not pb):
-        # Shares outstanding from EDGAR (for PBR market cap)
+    # EDGAR fallback for PBR
+    if not pb and price:
         shares = None
         for _ns in ("dei", "us-gaap"):
             for _tag in ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"):
@@ -197,37 +222,11 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
                         break
             if shares:
                 break
-
-        # PBR from EDGAR equity
-        if not pb and shares:
+        if shares:
             _eq = bs.get("StockholdersEquity", {}).get("current")
             eq = _f(_eq[0]) if _eq and _eq[0] is not None else None
             if eq and eq > 0:
                 pb = (price * shares) / eq
-
-        # PER from EDGAR — TTM diluted EPS (Yahoo Finance compatible)
-        if not pe and price:
-            for _eps_tag in ("EarningsPerShareDiluted", "EarningsPerShareBasic"):
-                _eps_recs = facts.get("facts", {}).get("us-gaap", {}) \
-                                 .get(_eps_tag, {}).get("units", {}).get("USD/shares", [])
-                if not _eps_recs:
-                    continue
-                # Try TTM: sum of last 4 individual quarterly EPS
-                ttm = _ttm_eps(_eps_recs)
-                if ttm and ttm > 0:
-                    pe, pe_label = price / ttm, "PER（実績）"
-                    break
-                # Fallback: most recent annual 10-K EPS
-                _annual = sorted(
-                    [r for r in _eps_recs
-                     if r.get("form") in ("10-K", "10-K/A") and r.get("val") is not None],
-                    key=lambda r: r.get("end", ""), reverse=True
-                )
-                if _annual:
-                    eps_val = _f(_annual[0].get("val"))
-                    if eps_val and eps_val > 0:
-                        pe, pe_label = price / eps_val, "PER（実績）"
-                        break
 
     return {"pe": pe, "pe_label": pe_label, "pb": pb}
 
