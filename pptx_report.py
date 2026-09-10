@@ -261,7 +261,7 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
         if not _t.empty:
             _add_native_chart(
                 s1, frames[0], _t["quarter_label"].tolist(), "売上高 (MUSD)",
-                [round(float(v)) for v in _t["revenue"]], "bar", '#,##0')
+                [round(float(v)) for v in _t["revenue"]], "line", '#,##0')
     if len(frames) >= 2 and price_df is not None and not price_df.empty:
         _p = price_df.dropna()
         if not _p.empty:
