@@ -21,6 +21,11 @@ try:
 except ImportError:
     yf = None
 
+try:
+    import pptx_report                      # 社内PPTテンプレートへの流し込み
+except Exception:                           # python-pptx未導入でもアプリは動かす
+    pptx_report = None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # yfinance Helpers (gracefully degrade when Yahoo Finance is blocked)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,6 +46,7 @@ def _search_tickers(query: str) -> list:
         return []
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def _get_chart_data(ticker: str):
     """Fetch 5Y daily close for ticker and optionally S&P500 (^GSPC).
     Returns (stock_df, sp500_df_or_None). stock_df is None only on total failure.
@@ -2852,6 +2858,51 @@ if st.session_state.get("filings"):
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            use_container_width=True)
         st.caption(f"ファイル名: `{fname}`  |  シート: Dashboard / Financial Data / MD&A_Text")
+
+        # ── PowerPointレポート（社内テンプレート準拠） ─────────────────
+        st.markdown("---")
+        st.markdown("## 📊 PowerPointレポートをダウンロード")
+        if pptx_report is not None and pptx_report.is_available():
+            st.markdown(
+                "社内テンプレート（2枚組）に、P&L・B/Sの数値、前年同期比／前四半期比の差額、"
+                "売上高の推移グラフ、株価推移グラフを自動で流し込みます。"
+                "グラフはPowerPoint上で編集可能なネイティブグラフとして挿入されます。"
+            )
+            if st.button("📊 PowerPointレポートを生成", use_container_width=True):
+                try:
+                    with st.spinner("テンプレートに数値とグラフを流し込み中…"):
+                        _px, _ = _get_chart_data(ticker)
+                        if _px is not None and not _px.empty:
+                            _cutoff = _px.index.max() - pd.Timedelta(days=365 * 3)
+                            _px = _px[_px.index >= _cutoff]
+                        _ppt_bytes = pptx_report.build_report(
+                            company_name=company_name, ticker=ticker, period=period,
+                            form=selected.get("form", "10-Q"), quarter_num=_q_num,
+                            pl=pl, bs=bs, trend_df=trend_df, price_df=_px,
+                        )
+                    _pfname = (f"{ticker.upper()}_report_{period}_"
+                               f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx")
+                    st.download_button(
+                        "⬇️ PowerPointをダウンロード", data=_ppt_bytes, file_name=_pfname,
+                        mime=("application/vnd.openxmlformats-officedocument"
+                              ".presentationml.presentation"),
+                        use_container_width=True,
+                    )
+                    st.success(f"生成しました: `{_pfname}`（2スライド構成）", icon="✅")
+                except Exception as _e:
+                    st.error(f"PowerPointの生成に失敗しました: {_e}")
+            st.caption(
+                "※ スライド1: P&L（前年同期比・差額を青字/赤字で色分け）＋売上高推移＋株価推移。"
+                "スライド2: B/S（前四半期 vs 今期・差額付き）。"
+                "「主要な良化/悪化要因」欄と内訳表は、テンプレート同様に空欄のままなので"
+                "ダウンロード後にご記入ください。"
+            )
+        else:
+            st.info(
+                "PowerPoint生成には `python-pptx` とテンプレート"
+                "（templates/parr_report_template.pptx）が必要です。"
+                "requirements.txt の再インストールをご確認ください。"
+            )
 
         # ── SEC EDGAR 原本リンク ──────────────────────────────────
         st.markdown("---")
