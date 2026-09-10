@@ -1059,92 +1059,188 @@ def build_bs_df(bs: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _classify_bs_tag(tag: str) -> str:
-    """B/Sタグ名から 資産/負債/資本 を簡易分類（キーワードベース）。"""
-    low = tag.lower()
-    if "liabilit" in low:
-        return "負債 / Liabilities"
-    equity_kw = (
-        "stockholdersequity", "partnerscapital", "memberscapital",
-        "retainedearnings", "additionalpaidincapital", "treasurystock",
-        "commonstockvalue", "preferredstockvalue",
-        "accumulatedothercomprehensiveincome", "minorityinterest",
-        "temporaryequity", "commonstocksincludingadditionalpaidincapital",
-    )
-    if any(k in low for k in equity_kw):
-        return "資本 / Equity"
-    return "資産 / Assets"
+def _bs_line_item(facts: dict, candidates: list, target: datetime | None):
+    """extract_bs() と同じロジックで、単一のXBRLタグ候補リストから当期・前四半期の
+    生値(raw USD, 未換算)を1組取得する（CONDENSED向けの個別科目ルックアップ用）。"""
+    tag, recs = _best_tag(facts, candidates)
+    instants = _dedup_latest(_filter_instant(recs), 100)
+    if not instants:
+        return None, None
+    cur_rec = _find_closest(instants, target, 65) if target else instants[0]
+    if cur_rec is None:
+        return None, None
+    cur_val = cur_rec.get("val")
+    cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+    prior_target = cur_end - timedelta(days=92)
+    others = [r for r in instants if r["end"] != cur_rec["end"]]
+    prior_rec = _find_closest(others, prior_target, 65)
+    pri_val = prior_rec.get("val") if prior_rec else None
+    return cur_val, pri_val
 
 
-def _prettify_tag(tag: str) -> str:
-    """CamelCase の XBRL タグ名を単語間スペース区切りに変換（可読性向上用）。"""
-    return re.sub(r"(?<!^)(?=[A-Z])", " ", tag)
+# (section_key, 表示ラベル, 候補タグ) — CONDENSED CONSOLIDATED BALANCE SHEETS の
+# 標準的な並び順・粒度を模した固定リスト。企業に存在しない科目は自動的にスキップされ、
+# 各セクションの「その他（未分類）」行に差額として吸収される。
+_CONDENSED_BS_LAYOUT = [
+    ("ca",  "売掛金 / Accounts Receivable, net",
+     ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent", "AccountsReceivableNet"]),
+    ("ca",  "棚卸資産 / Inventories",
+     ["InventoryNet", "InventoryNetCurrent"]),
+    ("ca",  "前払費用・その他流動資産 / Prepaid & Other Current Assets",
+     ["PrepaidExpenseAndOtherAssetsCurrent", "PrepaidExpenseCurrent", "OtherAssetsCurrent"]),
+    ("nca", "有形固定資産 / Property, Plant & Equipment, net",
+     ["PropertyPlantAndEquipmentNet"]),
+    ("nca", "使用権資産（オペレーティングリース）/ Operating Lease ROU Assets",
+     ["OperatingLeaseRightOfUseAsset"]),
+    ("nca", "のれん / Goodwill",
+     ["Goodwill"]),
+    ("nca", "無形資産 / Intangible Assets, net",
+     ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"]),
+    ("cl",  "買掛金 / Accounts Payable",
+     ["AccountsPayableCurrent", "AccountsPayableTradeCurrent"]),
+    ("cl",  "未払費用 / Accrued Liabilities",
+     ["AccruedLiabilitiesCurrent", "AccountsPayableAndAccruedLiabilitiesCurrent"]),
+    ("cl",  "長期負債の流動部分 / Current Portion of LT Debt",
+     ["LongTermDebtCurrent", "DebtCurrent"]),
+    ("cl",  "流動リース負債 / Current Operating Lease Liabilities",
+     ["OperatingLeaseLiabilityCurrent"]),
+    ("ncl", "長期負債 / Long-Term Debt",
+     ["LongTermDebtNoncurrent", "LongTermDebt"]),
+    ("ncl", "固定リース負債 / Non-Current Operating Lease Liabilities",
+     ["OperatingLeaseLiabilityNoncurrent"]),
+    ("ncl", "繰延税金負債 / Deferred Tax Liabilities",
+     ["DeferredIncomeTaxLiabilitiesNet", "DeferredTaxLiabilitiesNoncurrent"]),
+    ("eq",  "資本金 / Common Stock",
+     ["CommonStockValue"]),
+    ("eq",  "資本剰余金 / Additional Paid-in Capital",
+     ["AdditionalPaidInCapital", "AdditionalPaidInCapitalCommonStock"]),
+    ("eq",  "利益剰余金 / Retained Earnings (Accumulated Deficit)",
+     ["RetainedEarningsAccumulatedDeficit"]),
+    ("eq",  "その他包括利益累計額 / Accumulated OCI",
+     ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"]),
+    ("eq",  "自己株式 / Treasury Stock",
+     ["TreasuryStockValue", "TreasuryStockCommonValue"]),
+]
 
 
-def extract_bs_full(facts: dict, target_period: str | None = None) -> pd.DataFrame:
-    """PARR限定機能: SEC XBRLで報告されている全てのUSD建て時点(instant)項目を、
-    対象決算期と前四半期で比較する。主要B/S科目に加え、注記(footnote)レベルの
-    内訳項目が含まれる場合がある。戻り値は build_bs_df() と同じ列構成（_style_df 互換）に
-    内部列 "_category" を加えたもの。
+def extract_bs_condensed(facts: dict, bs: dict, target_period: str | None = None) -> pd.DataFrame:
+    """PARR限定機能: 実際の「CONDENSED CONSOLIDATED BALANCE SHEETS」に近い粒度・並び順で
+    B/Sを表示する（現金→売掛金→棚卸資産→…→流動資産合計→固定資産→資産合計→…の順）。
+
+    個別科目は専用のXBRLタグ候補から取得し、各セクションの小計は extract_bs() が
+    既に算出している公式の合計値（Cash / CurrentAssets / LongTermLiabilities /
+    StockholdersEquity 等）をそのまま使う。個別科目の合計と公式合計との差額は
+    「その他（未分類）」行に計上するため、小計は常に公式の値と一致する。
     """
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
-    us_gaap = facts.get("facts", {}).get("us-gaap", {})
 
-    raw_rows = []
-    for tag, tag_data in us_gaap.items():
-        recs = (tag_data.get("units", {}) or {}).get("USD")
-        if not recs:
-            continue
-        instants = _dedup_latest(_filter_instant(recs), 100)
-        if not instants:
-            continue
-        cur_rec = _find_closest(instants, target, 65) if target else instants[0]
-        if cur_rec is None or cur_rec.get("val") is None:
-            continue
-        cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
-        prior_target = cur_end - timedelta(days=92)
-        others = [r for r in instants if r["end"] != cur_rec["end"]]
-        prior_rec = _find_closest(others, prior_target, 65)
-
-        raw_rows.append({
-            "tag": tag,
-            "category": _classify_bs_tag(tag),
-            "cur_val": cur_rec.get("val"),
-            "cur_date": cur_rec["end"],
-            "pri_val": prior_rec.get("val") if prior_rec else None,
-        })
-
-    if not raw_rows:
-        return pd.DataFrame()
-
-    from collections import Counter
-    canon_cur = Counter(r["cur_date"] for r in raw_rows).most_common(1)[0][0]
+    canon_cur = _canon_date(bs, "current")
+    canon_pri = _canon_date(bs, "prior")
     cur_col = f"当四半期末 ({canon_cur})\n[USD M]"
-    pri_col = "前四半期末\n[USD M]"
+    pri_col = f"前四半期末 ({canon_pri})\n[USD M]"
+
+    def _official(key, which):
+        data = bs.get(key, {})
+        canon = canon_cur if which == "current" else canon_pri
+        return _safe_val(data, which) if _period_ok(data, which, canon) else None
+
+    def _row(label, cur, pri, is_bad_if_high, tag_note, is_subtotal=False):
+        cur = round(cur) if cur is not None else None
+        pri = round(pri) if pri is not None else None
+        delta = (cur - pri) if (cur is not None and pri is not None) else None
+        pct = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
+        return {
+            "項目 / Metric": label, cur_col: cur, pri_col: pri,
+            "差額 [USD M]": delta,
+            "変化率 %": "" if is_subtotal else _pct_label(pct, cur, pri, is_bad_if_high),
+            "_pct": None if is_subtotal else pct, "_is_cost": is_bad_if_high,
+            "_cur": cur, "_pri": pri, "_tag": tag_note, "_is_subtotal": is_subtotal,
+        }
+
+    # 個別科目をセクション別に集計（データが無い科目は自動的にスキップ）
+    sections = {"ca": [], "nca": [], "cl": [], "ncl": [], "eq": []}
+    for sec, label, candidates in _CONDENSED_BS_LAYOUT:
+        cur_raw, pri_raw = _bs_line_item(facts, candidates, target)
+        if cur_raw is None and pri_raw is None:
+            continue
+        cur_m = _m(cur_raw) if cur_raw is not None else None
+        pri_m = _m(pri_raw) if pri_raw is not None else None
+        sections[sec].append((label, cur_m, pri_m))
+
+    def _sum(items, idx):
+        return sum((it[idx] or 0) for it in items)
 
     rows = []
-    for r in raw_rows:
-        cur   = round(_m(r["cur_val"])) if r["cur_val"] is not None else None
-        pri   = round(_m(r["pri_val"])) if r["pri_val"] is not None else None
-        delta = (cur - pri) if (cur is not None and pri is not None) else None
-        pct   = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
-        is_liab = r["category"] == "負債 / Liabilities"
-        rows.append({
-            "項目 / Metric": f'{_prettify_tag(r["tag"])} ({r["tag"]})',
-            cur_col: cur, pri_col: pri,
-            "差額 [USD M]": delta, "変化率 %": _pct_label(pct, cur, pri, is_liab),
-            "_pct": pct, "_is_cost": is_liab, "_cur": cur, "_pri": pri,
-            "_tag": r["tag"], "_is_subtotal": False, "_category": r["category"],
-        })
 
-    df = pd.DataFrame(rows)
-    cat_order = {"資産 / Assets": 0, "負債 / Liabilities": 1, "資本 / Equity": 2}
-    df["_cat_order"] = df["_category"].map(cat_order)
-    df["_abs_cur"]   = df["_cur"].abs()
-    df = (df.sort_values(["_cat_order", "_abs_cur"], ascending=[True, False])
-            .drop(columns=["_cat_order", "_abs_cur"])
-            .reset_index(drop=True))
-    return df
+    # ── 資産の部 ──────────────────────────────────────────
+    cash_c, cash_p = _official("Cash", "current"), _official("Cash", "prior")
+    rows.append(_row("手元資金 / Cash & Equivalents", cash_c, cash_p, False, "Cash"))
+    for label, c, p in sections["ca"]:
+        rows.append(_row(label, c, p, False, "(内訳)"))
+    ca_c, ca_p = _official("CurrentAssets", "current"), _official("CurrentAssets", "prior")
+    named_ca_c = (cash_c or 0) + _sum(sections["ca"], 1)
+    named_ca_p = (cash_p or 0) + _sum(sections["ca"], 2)
+    plug_ca_c = (ca_c - named_ca_c) if ca_c is not None else None
+    plug_ca_p = (ca_p - named_ca_p) if ca_p is not None else None
+    rows.append(_row("その他流動資産（未分類）/ Other Current Assets",
+                      plug_ca_c, plug_ca_p, False, "(算出差額)"))
+    rows.append(_row("▶ 流動資産合計 / Total Current Assets",
+                      ca_c, ca_p, False, "(小計)", is_subtotal=True))
+
+    for label, c, p in sections["nca"]:
+        rows.append(_row(label, c, p, False, "(内訳)"))
+    nca_c, nca_p = _official("NonCurrentAssets", "current"), _official("NonCurrentAssets", "prior")
+    plug_nca_c = (nca_c - _sum(sections["nca"], 1)) if nca_c is not None else None
+    plug_nca_p = (nca_p - _sum(sections["nca"], 2)) if nca_p is not None else None
+    rows.append(_row("その他固定資産（未分類）/ Other Non-Current Assets",
+                      plug_nca_c, plug_nca_p, False, "(算出差額)"))
+
+    total_assets_c = (ca_c + nca_c) if (ca_c is not None and nca_c is not None) else None
+    total_assets_p = (ca_p + nca_p) if (ca_p is not None and nca_p is not None) else None
+    rows.append(_row("▶ 資産合計 / Total Assets",
+                      total_assets_c, total_assets_p, False, "(合計)", is_subtotal=True))
+
+    # ── 負債の部 ──────────────────────────────────────────
+    for label, c, p in sections["cl"]:
+        rows.append(_row(label, c, p, True, "(内訳)"))
+    cl_c, cl_p = _official("CurrentLiabilities", "current"), _official("CurrentLiabilities", "prior")
+    plug_cl_c = (cl_c - _sum(sections["cl"], 1)) if cl_c is not None else None
+    plug_cl_p = (cl_p - _sum(sections["cl"], 2)) if cl_p is not None else None
+    rows.append(_row("その他流動負債（未分類）/ Other Current Liabilities",
+                      plug_cl_c, plug_cl_p, True, "(算出差額)"))
+    rows.append(_row("▶ 流動負債合計 / Total Current Liabilities",
+                      cl_c, cl_p, True, "(小計)", is_subtotal=True))
+
+    for label, c, p in sections["ncl"]:
+        rows.append(_row(label, c, p, True, "(内訳)"))
+    ncl_c, ncl_p = _official("LongTermLiabilities", "current"), _official("LongTermLiabilities", "prior")
+    plug_ncl_c = (ncl_c - _sum(sections["ncl"], 1)) if ncl_c is not None else None
+    plug_ncl_p = (ncl_p - _sum(sections["ncl"], 2)) if ncl_p is not None else None
+    rows.append(_row("その他固定負債（未分類）/ Other Non-Current Liabilities",
+                      plug_ncl_c, plug_ncl_p, True, "(算出差額)"))
+
+    total_liab_c = (cl_c + ncl_c) if (cl_c is not None and ncl_c is not None) else None
+    total_liab_p = (cl_p + ncl_p) if (cl_p is not None and ncl_p is not None) else None
+    rows.append(_row("▶ 負債合計 / Total Liabilities",
+                      total_liab_c, total_liab_p, True, "(合計)", is_subtotal=True))
+
+    # ── 資本の部 ──────────────────────────────────────────
+    for label, c, p in sections["eq"]:
+        rows.append(_row(label, c, p, False, "(内訳)"))
+    eq_c, eq_p = _official("StockholdersEquity", "current"), _official("StockholdersEquity", "prior")
+    plug_eq_c = (eq_c - _sum(sections["eq"], 1)) if eq_c is not None else None
+    plug_eq_p = (eq_p - _sum(sections["eq"], 2)) if eq_p is not None else None
+    rows.append(_row("その他資本（未分類）/ Other Equity Items",
+                      plug_eq_c, plug_eq_p, False, "(算出差額)"))
+    rows.append(_row("▶ 資本合計 / Total Stockholders' Equity",
+                      eq_c, eq_p, False, "(合計)", is_subtotal=True))
+
+    total_le_c = (total_liab_c + eq_c) if (total_liab_c is not None and eq_c is not None) else None
+    total_le_p = (total_liab_p + eq_p) if (total_liab_p is not None and eq_p is not None) else None
+    rows.append(_row("▶ 負債・資本合計 / Total Liabilities and Equity",
+                      total_le_c, total_le_p, False, "(合計)", is_subtotal=True))
+
+    return pd.DataFrame(rows)
 
 
 def _bs_imbalance_note(df: pd.DataFrame) -> str:
@@ -2042,35 +2138,22 @@ if st.session_state.get("filings"):
         if _bs_note:
             st.caption(_bs_note)
 
-        # ── PARR限定: B/S 全項目（前四半期比較） ─────────────────────
+        # ── PARR限定: B/S 詳細版（Condensed Consolidated Balance Sheets相当） ──
         if is_parr:
             st.markdown("---")
-            st.markdown("## 🏦 貸借対照表（B/S）— 全項目（PARR限定・前四半期比較）")
+            st.markdown("## 🏦 貸借対照表（B/S）— 詳細版（PARR限定・前四半期比較）")
             st.caption(
-                "※ SEC XBRLで報告されている全てのUSD建て時点(instant)項目が対象です。"
-                "主要科目に加え、注記(footnote)レベルの内訳項目が含まれる場合があります。"
-                "原本ファイリングでのバックチェックを推奨します。"
+                "※ 実際のCONDENSED CONSOLIDATED BALANCE SHEETSに近い粒度・並び順で表示しています。"
+                "個別科目に含まれない残差は各セクションの「その他（未分類）」行に計上されるため、"
+                "各小計は上のB/Sサマリーと一致します。原本ファイリングでのバックチェックを推奨します。"
             )
-            with st.spinner("全B/S項目を集計中…"):
-                bs_full_df = extract_bs_full(facts, period)
-            if bs_full_df is not None and not bs_full_df.empty:
-                n_a = int((bs_full_df["_category"] == "資産 / Assets").sum())
-                n_l = int((bs_full_df["_category"] == "負債 / Liabilities").sum())
-                n_e = int((bs_full_df["_category"] == "資本 / Equity").sum())
-                st.caption(f"検出項目数: {len(bs_full_df)} 件（資産 {n_a} ／ 負債 {n_l} ／ 資本 {n_e}）")
-                for cat_label, cat_key, expanded in (
-                    ("💰 資産の部 / Assets", "資産 / Assets", True),
-                    ("📑 負債の部 / Liabilities", "負債 / Liabilities", False),
-                    ("🏛️ 資本の部 / Equity", "資本 / Equity", False),
-                ):
-                    sub = bs_full_df[bs_full_df["_category"] == cat_key]
-                    if sub.empty:
-                        continue
-                    with st.expander(f"{cat_label}（{len(sub)}件）", expanded=expanded):
-                        st.dataframe(_style_df(sub), width="stretch",
-                                     height=min(420, 60 + 35 * len(sub)))
+            with st.spinner("B/S詳細版を集計中…"):
+                bs_condensed_df = extract_bs_condensed(facts, bs, period)
+            if bs_condensed_df is not None and not bs_condensed_df.empty:
+                st.dataframe(_style_df(bs_condensed_df), width="stretch",
+                             height=min(650, 60 + 35 * len(bs_condensed_df)))
             else:
-                st.info("全B/S項目データを算出できませんでした。")
+                st.info("B/S詳細版データを算出できませんでした。")
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
