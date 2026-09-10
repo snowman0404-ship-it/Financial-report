@@ -368,27 +368,79 @@ PL_LABELS = {
     "NetIncomeLoss":       "純利益 / Net Income",
 }
 
+# PARR以外（一般企業）向け。標準的な損益計算書の並びを網羅し、候補タグも大幅に拡充。
+# 直接タグが取得できない項目は extract_pl() 内で会計恒等式から導出する。
 SIMPLE_PL_TAGS = {
     "Revenues": [
-        "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "Revenues", "SalesRevenueNet", "SalesRevenueGoodsNet",
+        "SalesAndRevenuesNet", "RevenuesNetOfInterestExpense",
+        "RevenueFromContractWithCustomerExcludingAssessedTaxProductAndService",
+    ],
+    "CostOfRevenue": [
+        "CostOfRevenue",
+        "CostOfGoodsAndServicesSold",
+        "CostOfGoodsSold",
+        "CostOfSales",
+        "CostsOfRevenue",
+        "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
     ],
     "GrossProfit": ["GrossProfit"],
+    "OperatingExpenses": [
+        "OperatingExpenses",
+        "OperatingCostsAndExpenses",
+        "CostsAndExpenses",
+        "CostAndExpenses",
+    ],
     "OperatingIncomeLoss": [
         "OperatingIncomeLoss",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     ],
+    # Excel出力(_build_fd_sheet)と同じキー名を使うためキーは InterestExpense のまま
+    "InterestExpense": [
+        "NonoperatingIncomeExpense",
+        "OtherNonoperatingIncomeExpense",
+        "OtherNonoperatingExpense",
+        "NonoperatingExpense",
+        "InterestIncomeExpenseNet",
+        "InterestAndDebtExpense",
+        "InterestExpense",
+    ],
+    "IncomeLossBeforeTax": [
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+    ],
+    "IncomeTaxExpense": [
+        "IncomeTaxExpenseBenefit",
+        "CurrentIncomeTaxExpenseBenefit",
+    ],
     "NetIncomeLoss": [
-        "NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "NetIncomeLoss", "ProfitLoss",
+        "NetIncomeLossAvailableToCommonStockholdersBasic",
+        "IncomeLossFromContinuingOperations",
+        "NetIncomeLossAttributableToParentCompany",
     ],
 }
 
 SIMPLE_PL_LABELS = {
     "Revenues":            "売上高 / Revenues",
+    "CostOfRevenue":       "売上原価 / Cost of Revenue",
     "GrossProfit":         "売上総利益 / Gross Profit",
+    "OperatingExpenses":   "営業費用 / Operating Expenses",
     "OperatingIncomeLoss": "営業利益 / Operating Income",
+    "InterestExpense":     "営業外損益 / Non-Operating Income (Expense)",
+    "IncomeLossBeforeTax": "税引前利益 / Income Before Tax",
+    "IncomeTaxExpense":    "法人税等 / Income Tax Expense",
     "NetIncomeLoss":       "純利益 / Net Income",
 }
+
+# 四半期トレンドグラフ用（全企業対象）: PARR用と一般企業用の候補タグを統合したもの
+_TREND_REVENUE_TAGS = list(dict.fromkeys(
+    PL_TAGS["Revenues"] + SIMPLE_PL_TAGS["Revenues"]))
+_TREND_NETINCOME_TAGS = list(dict.fromkeys(
+    PL_TAGS["NetIncomeLoss"] + SIMPLE_PL_TAGS["NetIncomeLoss"]))
 BS_LABELS = {
     "Cash":               "手元資金 / Cash & Equivalents",
     "CurrentLiabilities": "流動負債 / Current Liabilities",
@@ -645,12 +697,45 @@ def _units(facts: dict, tag: str) -> list:
         return []
 
 
-def _best_tag(facts: dict, candidates: list) -> tuple[str, list]:
+def _nearest_days(records: list, target: datetime | None) -> int | None:
+    """レコード群の中で target に最も近い end 日付との差（日数）。"""
+    if target is None or not records:
+        return None
+    best = None
+    for r in records:
+        try:
+            d = abs((datetime.strptime(r["end"], "%Y-%m-%d") - target).days)
+            if best is None or d < best:
+                best = d
+        except (ValueError, KeyError, TypeError):
+            pass
+    return best
+
+
+def _best_tag(facts: dict, candidates: list, target: datetime | None = None,
+              tolerance_days: int = 65) -> tuple[str, list]:
+    """対象期をカバーしている候補タグを選ぶ。
+
+    企業は年度によって使用するXBRLタグを変える（例: Revenues →
+    RevenueFromContractWithCustomerExcludingAssessedTax）。「データが存在する
+    最初の候補」を無条件に採用すると、対象期のデータを持たない旧タグを掴んで
+    N/Aになることがあるため、target が与えられた場合は対象期に最も近い
+    レコードを持つ候補を優先する。target が無い場合は従来通りの挙動。
+    """
+    first_tag, first_recs = "", []
+    best_tag, best_recs, best_d = "", [], None
     for tag in candidates:
         recs = _units(facts, tag)
-        if recs:
-            return tag, recs
-    return "", []
+        if not recs:
+            continue
+        if not first_recs:
+            first_tag, first_recs = tag, recs
+        d = _nearest_days(_filter_instant(recs) or recs, target)
+        if d is not None and d <= tolerance_days and (best_d is None or d < best_d):
+            best_tag, best_recs, best_d = tag, recs, d
+    if best_recs:
+        return best_tag, best_recs
+    return first_tag, first_recs
 
 
 # Duration ranges per fiscal quarter: (strict_lo, strict_hi, relaxed_lo, relaxed_hi) in days
@@ -688,27 +773,46 @@ def _quarter_num(period_str: str, fy_end_mmdd: str) -> int:
         return 1
 
 
-def _best_ytd_tag(facts: dict, candidates: list, quarter_num: int) -> tuple[str, list, list]:
-    """Return (tag, all_recs, period_recs) for the first candidate whose records match
+def _best_ytd_tag(facts: dict, candidates: list, quarter_num: int,
+                  target: datetime | None = None,
+                  tolerance_days: int = 65) -> tuple[str, list, list]:
+    """Return (tag, all_recs, period_recs) for the candidate whose records match
     the YTD duration for the given fiscal quarter (1=3M, 2=6M, 3=9M, 4=12M).
-    Falls back to relaxed window, then any records."""
+
+    target が与えられた場合は「対象期に最も近いレコードを持つ候補」を優先する
+    （企業が年度途中でタグを切り替えているケースで、旧タグを掴んでN/Aになるのを防ぐ）。
+    厳密な期間レンジで一致する候補を、緩いレンジより優先する。
+    target が無い場合は従来通り「最初に一致した候補」を返す。
+    """
     lo, hi, rlo, rhi = _QUARTER_RANGES.get(quarter_num, _QUARTER_RANGES[1])
     any_tag, any_recs = "", []
-    relaxed_tag, relaxed_recs, relaxed_f = "", [], []
+    strict_first = None
+    relaxed_first = None
+    best = None                      # (rank, tag, recs, period_recs)
     for tag in candidates:
         recs = _units(facts, tag)
         if not recs:
             continue
-        f = _filter_duration(recs, lo, hi)
-        if f:
-            return tag, recs, f
-        fw = _filter_duration(recs, rlo, rhi)
-        if fw and not relaxed_tag:
-            relaxed_tag, relaxed_recs, relaxed_f = tag, recs, fw
         if not any_recs:
             any_tag, any_recs = tag, recs
-    if relaxed_tag:
-        return relaxed_tag, relaxed_recs, relaxed_f
+        f  = _filter_duration(recs, lo, hi)
+        fw = f or _filter_duration(recs, rlo, rhi)
+        if f and strict_first is None:
+            strict_first = (tag, recs, f)
+        if fw and relaxed_first is None:
+            relaxed_first = (tag, recs, fw)
+        if target is not None and fw:
+            d = _nearest_days(fw, target)
+            if d is not None and d <= tolerance_days:
+                rank = (d, 0 if f else 1)     # 近さ優先、同距離なら厳密レンジ優先
+                if best is None or rank < best[0]:
+                    best = (rank, tag, recs, fw)
+    if best is not None:
+        return best[1], best[2], best[3]
+    if strict_first:
+        return strict_first
+    if relaxed_first:
+        return relaxed_first
     return any_tag, any_recs, []
 
 
@@ -750,7 +854,7 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
     tag_set = PL_TAGS if is_parr else SIMPLE_PL_TAGS
 
     for metric, candidates in tag_set.items():
-        tag, _recs, period_recs = _best_ytd_tag(facts, candidates, effective_q)
+        tag, _recs, period_recs = _best_ytd_tag(facts, candidates, effective_q, target)
         period_recs = _dedup_latest(period_recs, 100)
         current = prior = None
         if period_recs:
@@ -780,14 +884,58 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
                     result.setdefault("OperatingExpenses", {})[which] = (
                         r_t[0] - o_t[0], r_t[1], "※導出値: Revenues − OperatingIncomeLoss"
                     )
+    else:
+        # 一般企業向け: 直接タグが取得できなかった項目を会計恒等式から補完する。
+        # 企業ごとに開示する科目が異なるため、取得できた科目だけを使って
+        # 補完可能なものを順に埋めていく（補完できない場合は N/A のまま）。
+        def _t(metric, which):
+            v = result.get(metric, {}).get(which)
+            return v if (v and v[0] is not None) else None
+
+        def _set(metric, which, val, ref, note):
+            result.setdefault(metric, {"current": None, "prior": None})[which] = (val, ref[1], note)
+
+        for which in ("current", "prior"):
+            rev = _t("Revenues", which)
+            cor = _t("CostOfRevenue", which)
+            gp  = _t("GrossProfit", which)
+            opi = _t("OperatingIncomeLoss", which)
+            nop = _t("InterestExpense", which)
+            ibt = _t("IncomeLossBeforeTax", which)
+            ni  = _t("NetIncomeLoss", which)
+
+            # 売上総利益 = 売上高 − 売上原価
+            if gp is None and rev and cor:
+                _set("GrossProfit", which, rev[0] - cor[0], rev,
+                     "※導出値: Revenues − CostOfRevenue")
+                gp = _t("GrossProfit", which)
+            # 売上原価 = 売上高 − 売上総利益
+            if cor is None and rev and gp:
+                _set("CostOfRevenue", which, rev[0] - gp[0], rev,
+                     "※導出値: Revenues − GrossProfit")
+            # 営業費用 = 売上高 − 営業利益
+            if _t("OperatingExpenses", which) is None and rev and opi:
+                _set("OperatingExpenses", which, rev[0] - opi[0], rev,
+                     "※導出値: Revenues − OperatingIncomeLoss")
+            # 税引前利益 = 営業利益 + 営業外損益
+            if ibt is None and opi and nop:
+                _set("IncomeLossBeforeTax", which, opi[0] + nop[0], opi,
+                     "※導出値: OperatingIncome + NonOperating")
+                ibt = _t("IncomeLossBeforeTax", which)
+            # 法人税等 = 税引前利益 − 純利益
+            if _t("IncomeTaxExpense", which) is None and ibt and ni:
+                _set("IncomeTaxExpense", which, ibt[0] - ni[0], ibt,
+                     "※導出値: IncomeBeforeTax − NetIncome")
 
     return result
 
 
 def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.DataFrame:
-    """PARR限定機能: 決算期リスト（最大24期）から、過去N年分の「四半期単独」の
-    売上高・純利益を算出する。10-Qは累積(YTD)値、10-Kは通期値として開示されるため、
-    前の四半期までの累積値を差し引く de-cumulation を行う（例: Q2単独 = 6ヶ月累積 − Q1）。
+    """決算期リスト（最大24期）から、過去N年分の「四半期単独」の売上高・純利益を算出する
+    （全企業対象）。10-Qは累積(YTD)値、10-Kは通期値として開示されるため、前の四半期までの
+    累積値を差し引く de-cumulation を行う（例: Q2単独 = 6ヶ月累積 − Q1）。
+    タグ候補はPARR用・一般企業用を統合したものを使い、期ごとに対象期に最も近い
+    レコードを持つタグを選ぶため、年度途中でタグを切り替えた企業にも追従できる。
     直近フィリングの期末日を基準に過去N年分に絞り込んで返す。
     """
     ordered = sorted(
@@ -804,8 +952,8 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
         eff_q  = 4 if form == "10-K" else q_num
         target = datetime.strptime(period, "%Y-%m-%d")
 
-        _, _, rev_recs = _best_ytd_tag(facts, PL_TAGS["Revenues"], eff_q)
-        _, _, ni_recs  = _best_ytd_tag(facts, PL_TAGS["NetIncomeLoss"], eff_q)
+        _, _, rev_recs = _best_ytd_tag(facts, _TREND_REVENUE_TAGS, eff_q, target)
+        _, _, ni_recs  = _best_ytd_tag(facts, _TREND_NETINCOME_TAGS, eff_q, target)
         rev_recs = _dedup_latest(rev_recs, 100)
         ni_recs  = _dedup_latest(ni_recs, 100)
         rev_rec  = _find_closest(rev_recs, target, 65) if rev_recs else None
@@ -846,7 +994,7 @@ def extract_bs(facts: dict, target_period: str | None = None) -> dict:
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
     result = {}
     for metric, candidates in BS_TAGS.items():
-        tag, recs = _best_tag(facts, candidates)
+        tag, recs = _best_tag(facts, candidates, target)
         instants = _dedup_latest(_filter_instant(recs), 100)
         current = prior = None
         if instants:
@@ -1062,7 +1210,7 @@ def build_bs_df(bs: dict) -> pd.DataFrame:
 def _bs_line_item(facts: dict, candidates: list, target: datetime | None):
     """extract_bs() と同じロジックで、単一のXBRLタグ候補リストから当期・前四半期の
     生値(raw USD, 未換算)を1組取得する（CONDENSED向けの個別科目ルックアップ用）。"""
-    tag, recs = _best_tag(facts, candidates)
+    tag, recs = _best_tag(facts, candidates, target)
     instants = _dedup_latest(_filter_instant(recs), 100)
     if not instants:
         return None, None
@@ -1270,9 +1418,10 @@ def _bs_imbalance_note(df: pd.DataFrame) -> str:
 
 def _style_df(df: pd.DataFrame):
     display_cols = [c for c in df.columns if not c.startswith("_")]
-    display_df   = df[display_cols].reset_index(drop=True)
+    display_df   = df[display_cols].reset_index(drop=True).copy()
 
-    # Convert None → NaN in numeric cols so na_rep="N/A" applies correctly
+    # 数値列は数値型のまま保持する（st.dataframe が右寄せ表示するため）。
+    # 欠損セルは Streamlit 側が薄いグレーの "None" プレースホルダで描画する。
     for col in display_cols:
         if "USD M" in col or "差額" in col:
             display_df[col] = pd.to_numeric(display_df[col], errors="coerce")
@@ -2068,68 +2217,78 @@ if st.session_state.get("filings"):
         _ql = _Q_PERIOD_LABELS.get(_q_num, "")
         st.markdown(f"## 📊 損益計算書（P&L） — 前年同期比（YoY）  `{_ql}`")
         _pl_labels = PL_LABELS if is_parr else SIMPLE_PL_LABELS
-        st.dataframe(_style_df(build_pl_df(pl, labels=_pl_labels)), width="stretch", height=270)
+        _pl_df = build_pl_df(pl, labels=_pl_labels)
+        st.dataframe(_style_df(_pl_df), width="stretch",
+                     height=min(430, 60 + 35 * len(_pl_df)))
         st.info("★ **Non-GAAP**: PARR等エネルギー企業は在庫影響除き営業利益をMD&Aで確認してください。", icon="ℹ️")
-        st.caption(
-            "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
-            "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
-            "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
-        )
-
-        # ── PARR限定: 四半期別 売上高・純利益トレンド（過去3年） ──────────
         if is_parr:
-            st.markdown("---")
-            st.markdown("## 📈 四半期別 売上高・純利益の推移（過去3年）")
-            with st.spinner("決算期リストから四半期トレンドを計算中…"):
-                trend_df = extract_quarterly_trend(facts, filings, years=3)
-            if trend_df is not None and not trend_df.empty and (
-                trend_df["revenue"].notna().any() or trend_df["net_income"].notna().any()
-            ):
-                import plotly.graph_objects as go
-                _tfig = go.Figure()
-                _tfig.add_trace(go.Scatter(
-                    x=trend_df["quarter_label"], y=trend_df["revenue"].round(1),
-                    name="売上高 (USD M)", mode="lines+markers",
-                    line=dict(color="#2563EB", width=2), marker=dict(size=6),
-                    yaxis="y1",
-                    hovertemplate="%{x}<br>売上高: $%{y:,.1f}M<extra></extra>",
-                ))
-                _tfig.add_trace(go.Scatter(
-                    x=trend_df["quarter_label"], y=trend_df["net_income"].round(1),
-                    name="純利益 (USD M)", mode="lines+markers",
-                    line=dict(color="#16A34A", width=2, dash="dot"), marker=dict(size=6),
-                    yaxis="y2",
-                    hovertemplate="%{x}<br>純利益: $%{y:,.1f}M<extra></extra>",
-                ))
-                _tfig.update_layout(
-                    height=360,
-                    margin=dict(l=0, r=0, t=10, b=0),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                                xanchor="right", x=1),
-                    hovermode="x unified",
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                    xaxis=dict(showgrid=False, zeroline=False, title="決算期"),
-                    yaxis=dict(
-                        title="売上高 (USD M)", title_font_color="#2563EB",
-                        tickfont=dict(color="#2563EB"), showgrid=True,
-                        gridcolor="#F3F4F6", zeroline=False,
-                    ),
-                    yaxis2=dict(
-                        title="純利益 (USD M)", title_font_color="#16A34A",
-                        tickfont=dict(color="#16A34A"), overlaying="y", side="right",
-                        showgrid=False, zeroline=True, zerolinecolor="#E5E7EB",
-                    ),
-                )
-                st.plotly_chart(_tfig, use_container_width=True)
-                st.caption(
-                    "※ 10-Qは累積(YTD)値、10-Kは通期値として開示されるため、各四半期単独の値は"
-                    "前の四半期までの累積値を差し引いて算出（de-cumulation）しています。"
-                    "決算期リストの取得範囲（最大24期）を超える過去データが必要な場合、"
-                    "最も古い四半期の値は正しく算出できないことがあります。"
-                )
-            else:
-                st.info("四半期トレンドデータを算出できませんでした。")
+            st.caption(
+                "※ 本ツールはPar Pacific Holdings（PARR）を基準として設計されています。"
+                "他社では売上・費用の計上区分や勘定科目の定義が異なる場合があり、"
+                "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
+            )
+        else:
+            st.caption(
+                "※ 他社の場合、対象期に最も近いデータを持つXBRLタグを自動選択し、"
+                "直接開示されていない項目は会計恒等式から導出しています"
+                "（例: 売上総利益 = 売上高 − 売上原価、法人税等 = 税引前利益 − 純利益）。"
+                "業種により計上区分・勘定科目の定義が異なるため、重要な判断の際は"
+                "原本ファイリングでのバックチェックを推奨します。"
+            )
+
+        # ── 四半期別 売上高・純利益トレンド（過去3年・全企業対象） ──────────
+        st.markdown("---")
+        st.markdown("## 📈 四半期別 売上高・純利益の推移（過去3年）")
+        with st.spinner("決算期リストから四半期トレンドを計算中…"):
+            trend_df = extract_quarterly_trend(facts, filings, years=3)
+        if trend_df is not None and not trend_df.empty and (
+            trend_df["revenue"].notna().any() or trend_df["net_income"].notna().any()
+        ):
+            import plotly.graph_objects as go
+            _tfig = go.Figure()
+            _tfig.add_trace(go.Scatter(
+                x=trend_df["quarter_label"], y=trend_df["revenue"].round(1),
+                name="売上高 (USD M)", mode="lines+markers",
+                line=dict(color="#2563EB", width=2), marker=dict(size=6),
+                yaxis="y1",
+                hovertemplate="%{x}<br>売上高: $%{y:,.1f}M<extra></extra>",
+            ))
+            _tfig.add_trace(go.Scatter(
+                x=trend_df["quarter_label"], y=trend_df["net_income"].round(1),
+                name="純利益 (USD M)", mode="lines+markers",
+                line=dict(color="#16A34A", width=2, dash="dot"), marker=dict(size=6),
+                yaxis="y2",
+                hovertemplate="%{x}<br>純利益: $%{y:,.1f}M<extra></extra>",
+            ))
+            _tfig.update_layout(
+                height=360,
+                margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                            xanchor="right", x=1),
+                hovermode="x unified",
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                xaxis=dict(showgrid=False, zeroline=False, title="決算期"),
+                yaxis=dict(
+                    title="売上高 (USD M)", title_font_color="#2563EB",
+                    tickfont=dict(color="#2563EB"), showgrid=True,
+                    gridcolor="#F3F4F6", zeroline=False,
+                ),
+                yaxis2=dict(
+                    title="純利益 (USD M)", title_font_color="#16A34A",
+                    tickfont=dict(color="#16A34A"), overlaying="y", side="right",
+                    showgrid=False, zeroline=True, zerolinecolor="#E5E7EB",
+                ),
+            )
+            st.plotly_chart(_tfig, use_container_width=True)
+            st.caption(
+                "※ 10-Qは累積(YTD)値、10-Kは通期値として開示されるため、各四半期単独の値は"
+                "前の四半期までの累積値を差し引いて算出（de-cumulation）しています。"
+                "決算期リストの取得範囲（最大24期）を超える過去データが必要な場合、"
+                "最も古い四半期の値は正しく算出できないことがあります。"
+            )
+        else:
+            st.info("四半期トレンドデータを算出できませんでした。")
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
         _bs_df = build_bs_df(bs)
