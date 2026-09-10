@@ -65,6 +65,25 @@ def _set_runs(paragraph, text: str, rgb: tuple | None = None) -> None:
         runs[0].font.color.rgb = RGBColor(*rgb)
 
 
+def _clear_table_fill(table) -> None:
+    """表の塗りつぶしを全て解除して背景を透明にする。
+
+    セル個別に「塗りつぶしなし」を指定するだけでなく、テーブルスタイル側の
+    見出し行/縞模様/先頭列の強調フラグも落とす。これらが立っていると
+    スタイル由来の色がセル指定より優先されて残ることがあるため。
+    """
+    tbl = table._tbl
+    tbl_pr = tbl.find(
+        "{http://schemas.openxmlformats.org/drawingml/2006/main}tblPr")
+    if tbl_pr is not None:
+        for flag in ("firstRow", "lastRow", "firstCol", "lastCol",
+                     "bandRow", "bandCol"):
+            tbl_pr.set(flag, "0")
+    for row in table.rows:
+        for cell in row.cells:
+            cell.fill.background()          # <a:noFill/> を書き込む
+
+
 def _set_cell(table, row: int, col: int, text: str,
               para: int = 0, rgb: tuple | None = None) -> None:
     cell = table.cell(row, col)
@@ -234,24 +253,31 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
     for sh in s1.shapes:
         _replace_in_shape(sh, title_map)
 
+    # 列の並びは「左=前年度、右=最新」（時系列で左→右に読める向き）
     t1 = next(sh.table for sh in s1.shapes if sh.has_table)
-    _set_cell(t1, 0, 1, cur_y,   para=0)
+    _set_cell(t1, 0, 1, prior_y, para=0)
     _set_cell(t1, 0, 1, cur_q,   para=1)
-    _set_cell(t1, 0, 2, prior_y, para=0)
+    _set_cell(t1, 0, 2, cur_y,   para=0)
     _set_cell(t1, 0, 2, cur_q,   para=1)
 
     for i, (key, label, is_cost) in enumerate(_PL_ROWS, start=1):
         cur = _pl_value(pl, key, "current")
         pri = _pl_value(pl, key, "prior")
         diff = (cur - pri) if (cur is not None and pri is not None) else None
+        if key == "InterestExpense":
+            # 営業外損益は「符号付きの純額（マイナス＝費用）」で報告される場合と
+            # 「費用の絶対額（プラス）」で報告される場合がある。前者では値が
+            # 増える＝費用が減る＝良化なので、符号を見て良化方向を判定する。
+            _ref = cur if cur is not None else pri
+            is_cost = bool(_ref is not None and _ref > 0)
         if diff is None:
             rgb = _PLAIN_RGB
         else:
             improved = (diff < 0) if is_cost else (diff > 0)
             rgb = _GOOD_RGB if improved else _BAD_RGB
         _set_cell(t1, i, 0, label)
-        _set_cell(t1, i, 1, _fmt(cur))
-        _set_cell(t1, i, 2, _fmt(pri))
+        _set_cell(t1, i, 1, _fmt(pri))      # 左: 前年度
+        _set_cell(t1, i, 2, _fmt(cur))      # 右: 最新
         _set_cell(t1, i, 3, _fmt_signed(diff), rgb=rgb)
 
     # グラフ枠に売上高・株価チャートを差し込む
@@ -282,6 +308,8 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
         _replace_in_shape(sh, title_map)
 
     tables2 = [sh.table for sh in s2.shapes if sh.has_table]
+    for _t in tables2:                      # B/S側の表は背景を塗らない
+        _clear_table_fill(_t)
     t2 = tables2[0]
 
     cash_c = _bs_value(bs, "Cash", "current")
