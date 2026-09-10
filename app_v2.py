@@ -92,6 +92,19 @@ def _get_chart_data(ticker: str):
 _CRACK_SYMBOLS = {"crude": "CL=F", "gasoline": "RB=F", "distillate": "HO=F"}
 _GAL_PER_BBL = 42.0
 
+# カテゴリカル配色（8系列）。色覚多様性を考慮して検証済みの並び順で、
+# 系列数が変わっても各社の色が入れ替わらないよう固定順で割り当てる。
+_SERIES_COLORS = (
+    "#2a78d6",  # blue    ← 分析対象（PARR）に固定
+    "#eb6834",  # orange
+    "#1baf7a",  # aqua
+    "#eda100",  # yellow
+    "#e87ba4",  # magenta
+    "#008300",  # green
+    "#4a3aa7",  # violet
+    "#e34948",  # red
+)
+
 # 米国石油セクターの比較対象（独立系製油 ＋ 総合石油メジャー）
 _OIL_PEERS = (
     ("PARR", "Par Pacific Holdings", "独立系製油"),
@@ -169,22 +182,45 @@ def _get_market_conditions(years: int = 3) -> pd.DataFrame:
     return out[["quarter_label", "wti", "crack"]]
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def _get_peer_metrics(peers: tuple) -> pd.DataFrame:
-    """同業他社の規模・収益性・バリュエーション指標を yfinance からまとめて取得する。"""
+def _yf_info(ticker: str, attempts: int = 3) -> dict:
+    """yfinance の .info を取得する。
+
+    Yahoo Finance はセッション確立（cookie/crumb）に失敗すると空を返すことがあり、
+    ループの1銘柄目だけデータが取れない、という症状が出る。リトライと
+    fast_info フォールバックでこれを吸収する。
+    """
     try:
         import yfinance as yf
     except ImportError:
-        return pd.DataFrame()
+        return {}
+    _keys = ("marketCap", "totalRevenue", "trailingPE", "priceToBook")
+    for i in range(attempts):
+        try:
+            info = yf.Ticker(ticker).info or {}
+            if any(info.get(k) is not None for k in _keys):
+                return info
+        except Exception:
+            pass
+        time.sleep(0.5 * (i + 1))
+    # 最低限、時価総額だけでも fast_info から拾う
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        mc = getattr(fi, "market_cap", None)
+        return {"marketCap": mc} if mc else {}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_peer_metrics(peers: tuple) -> pd.DataFrame:
+    """同業他社の規模・収益性・バリュエーション指標を yfinance からまとめて取得する。"""
     import math
 
     rows = []
-    for ticker, name, group in peers:
-        info = {}
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception:
-            pass
+    for idx, (ticker, name, group) in enumerate(peers):
+        if idx:
+            time.sleep(0.25)          # 連続リクエストによるスロットリング回避
+        info = _yf_info(ticker)
 
         def _num(key, scale=1.0):
             try:
@@ -593,6 +629,8 @@ _TREND_REVENUE_TAGS = list(dict.fromkeys(
     PL_TAGS["Revenues"] + SIMPLE_PL_TAGS["Revenues"]))
 _TREND_NETINCOME_TAGS = list(dict.fromkeys(
     PL_TAGS["NetIncomeLoss"] + SIMPLE_PL_TAGS["NetIncomeLoss"]))
+_TREND_OPINCOME_TAGS = list(dict.fromkeys(
+    PL_TAGS["OperatingIncomeLoss"] + SIMPLE_PL_TAGS["OperatingIncomeLoss"]))
 BS_LABELS = {
     "Cash":               "手元資金 / Cash & Equivalents",
     "CurrentLiabilities": "流動負債 / Current Liabilities",
@@ -1118,7 +1156,7 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
         key=lambda f: f["period"],
     )
     rows = []
-    prev_rev = prev_ni = None
+    prev_rev = prev_ni = prev_op = None
     for f in ordered:
         period = f["period"]
         form   = f.get("form", "10-Q")
@@ -1129,6 +1167,7 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
 
         direct_rev, ytd_rev = _trend_period_values(facts, _TREND_REVENUE_TAGS, eff_q, target)
         direct_ni,  ytd_ni  = _trend_period_values(facts, _TREND_NETINCOME_TAGS, eff_q, target)
+        direct_op,  ytd_op  = _trend_period_values(facts, _TREND_OPINCOME_TAGS, eff_q, target)
 
         def _resolve(direct, ytd, prev):
             # 3ヶ月単独の開示があればそのまま採用。無ければYTDから差し引いて算出。
@@ -1142,14 +1181,16 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
 
         q_rev = _resolve(direct_rev, ytd_rev, prev_rev)
         q_ni  = _resolve(direct_ni,  ytd_ni,  prev_ni)
+        q_op  = _resolve(direct_op,  ytd_op,  prev_op)
 
-        prev_rev, prev_ni = ytd_rev, ytd_ni
+        prev_rev, prev_ni, prev_op = ytd_rev, ytd_ni, ytd_op
 
         rows.append({
             "period": period, "period_dt": target, "form": form, "quarter_num": eff_q,
             "quarter_label": f"{target.year}Q{eff_q}",
             "revenue": _m(q_rev) if q_rev is not None else None,
             "net_income": _m(q_ni) if q_ni is not None else None,
+            "operating_income": _m(q_op) if q_op is not None else None,
         })
 
     df = pd.DataFrame(rows)
@@ -2410,54 +2451,90 @@ if st.session_state.get("filings"):
 
         # ── 四半期別 売上高・純利益トレンド（過去3年・全企業対象） ──────────
         st.markdown("---")
-        st.markdown("## 📈 四半期別 売上高・純利益の推移（過去3年）")
+        st.markdown("## 📈 四半期別 売上高・利益の推移（過去3年）")
         with st.spinner("決算期リストから四半期トレンドを計算中…"):
             trend_df = extract_quarterly_trend(facts, filings, years=3)
         if trend_df is not None and not trend_df.empty and (
             trend_df["revenue"].notna().any() or trend_df["net_income"].notna().any()
         ):
             import plotly.graph_objects as go
-            _tfig = go.Figure()
-            _tfig.add_trace(go.Scatter(
-                x=trend_df["quarter_label"], y=trend_df["revenue"].round(1),
-                name="売上高 (USD M)", mode="lines+markers",
-                line=dict(color="#2563EB", width=2), marker=dict(size=6),
-                yaxis="y1",
-                hovertemplate="%{x}<br>売上高: $%{y:,.1f}M<extra></extra>",
-            ))
-            _tfig.add_trace(go.Scatter(
-                x=trend_df["quarter_label"], y=trend_df["net_income"].round(1),
-                name="純利益 (USD M)", mode="lines+markers",
-                line=dict(color="#16A34A", width=2, dash="dot"), marker=dict(size=6),
-                yaxis="y2",
-                hovertemplate="%{x}<br>純利益: $%{y:,.1f}M<extra></extra>",
-            ))
-            _tfig.update_layout(
-                height=360,
-                margin=dict(l=0, r=0, t=10, b=0),
-                legend=dict(orientation="h", yanchor="bottom", y=1.01,
-                            xanchor="right", x=1),
-                hovermode="x unified",
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                xaxis=dict(showgrid=False, zeroline=False, title="決算期"),
-                yaxis=dict(
-                    title="売上高 (USD M)", title_font_color="#2563EB",
-                    tickfont=dict(color="#2563EB"), showgrid=True,
-                    gridcolor="#F3F4F6", zeroline=False,
-                ),
-                yaxis2=dict(
-                    title="純利益 (USD M)", title_font_color="#16A34A",
-                    tickfont=dict(color="#16A34A"), overlaying="y", side="right",
-                    showgrid=False, zeroline=True, zerolinecolor="#E5E7EB",
-                ),
-            )
-            st.plotly_chart(_tfig, use_container_width=True)
+
+            def _trend_layout(fig, y_title, height=330):
+                # 売上高と利益は桁が違うため2軸に混ぜず、別グラフ・単一軸で描く
+                fig.update_layout(
+                    height=height,
+                    margin=dict(l=0, r=10, t=10, b=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                                xanchor="right", x=1),
+                    hovermode="x unified",
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    xaxis=dict(showgrid=False, zeroline=False, title="決算期"),
+                    yaxis=dict(title=y_title, showgrid=True, gridcolor="#F3F4F6",
+                               zeroline=True, zerolinecolor="#D1D5DB"),
+                )
+                return fig
+
+            _c_rev, _c_inc = st.columns(2)
+
+            with _c_rev:
+                st.markdown("##### 売上高（四半期単独）")
+                _rfig = go.Figure()
+                _rfig.add_trace(go.Scatter(
+                    x=trend_df["quarter_label"], y=trend_df["revenue"].round(1),
+                    name="売上高", mode="lines+markers",
+                    line=dict(color=_SERIES_COLORS[0], width=2), marker=dict(size=8),
+                    hovertemplate="%{x}<br>売上高: $%{y:,.1f}M<extra></extra>",
+                ))
+                st.plotly_chart(_trend_layout(_rfig, "売上高 (USD M)"),
+                                use_container_width=True)
+
+            with _c_inc:
+                st.markdown("##### 営業利益 vs 純利益（四半期単独）")
+                _ifig = go.Figure()
+                if trend_df["operating_income"].notna().any():
+                    _ifig.add_trace(go.Scatter(
+                        x=trend_df["quarter_label"],
+                        y=trend_df["operating_income"].round(1),
+                        name="営業利益", mode="lines+markers",
+                        line=dict(color=_SERIES_COLORS[1], width=2), marker=dict(size=8),
+                        hovertemplate="%{x}<br>営業利益: $%{y:,.1f}M<extra></extra>",
+                    ))
+                _ifig.add_trace(go.Scatter(
+                    x=trend_df["quarter_label"], y=trend_df["net_income"].round(1),
+                    name="純利益", mode="lines+markers",
+                    line=dict(color=_SERIES_COLORS[2], width=2, dash="dot"),
+                    marker=dict(size=8),
+                    hovertemplate="%{x}<br>純利益: $%{y:,.1f}M<extra></extra>",
+                ))
+                st.plotly_chart(_trend_layout(_ifig, "利益 (USD M)"),
+                                use_container_width=True)
+
+            # 純利益が営業利益を上回る四半期＝本業以外の一時要因が効いた四半期
+            _gap = trend_df.dropna(subset=["operating_income", "net_income"]).copy()
+            if not _gap.empty:
+                _gap["diff"] = _gap["net_income"] - _gap["operating_income"]
+                _odd = _gap[_gap["diff"] > 0]
+                if not _odd.empty:
+                    _list = "、".join(
+                        f"{r.quarter_label}（+${r.diff:,.0f}M）"
+                        for r in _odd.sort_values("diff", ascending=False)
+                        .head(4).itertuples()
+                    )
+                    st.info(
+                        f"💡 **純利益が営業利益を上回った四半期**: {_list}\n\n"
+                        "通常は営業利益 ＞ 純利益（そこから支払利息・税金が引かれるため）です。"
+                        "逆転している四半期は、本業（市況）以外の一時要因"
+                        "— 税金費用の戻し入れ（繰延税金資産の評価性引当金の取り崩し等）、"
+                        "規制関連の引当戻入（製油業ではRFS/RINやSRE=小規模製油所免除）、"
+                        "資産売却益・買収に伴う一時利益 — が効いている可能性が高い箇所です。"
+                        "該当四半期のMD&A原本で要因を確認してください。",
+                        icon="🔎",
+                    )
             st.caption(
-                "※ 10-Qは累積(YTD)値、10-Kは通期値として開示されるため、各四半期単独の値は"
-                "前の四半期までの累積値を差し引いて算出（de-cumulation）しています。"
-                "決算期リストの取得範囲（最大24期）を超える過去データが必要な場合、"
-                "最も古い四半期の値は正しく算出できないことがあります。"
+                "※ 3ヶ月単独の期間データが開示されていればそれを使用し、累積(YTD)しか"
+                "開示されていない企業についてのみ、前の四半期までの累積値を差し引いて"
+                "算出（de-cumulation）しています。決算期リストの取得範囲（最大24期）を"
+                "超える過去データが必要な場合、最も古い四半期の値は正しく算出できないことがあります。"
             )
         else:
             st.info("四半期トレンドデータを算出できませんでした。")
@@ -2578,6 +2655,39 @@ if st.session_state.get("filings"):
                 _num_cols = ["時価総額 [USD B]", "売上高TTM [USD B]",
                              "営業利益率 %", "純利益率 %", "PER", "PBR"]
 
+                # Yahoo Finance が自社分を返さなかった場合、既に取得済みの
+                # SEC EDGARデータ（直近4四半期＝TTM）で補完する。
+                _self_idx = _peer_df.index[_peer_df["ティッカー"] == ticker.upper()]
+                if len(_self_idx) and trend_df is not None and not trend_df.empty:
+                    _i = _self_idx[0]
+                    _ttm = trend_df.dropna(subset=["revenue"]).tail(4)
+                    if len(_ttm) == 4:
+                        _rev_ttm = float(_ttm["revenue"].sum())          # USD M
+                        if pd.isna(_peer_df.at[_i, "売上高TTM [USD B]"]):
+                            _peer_df.at[_i, "売上高TTM [USD B]"] = _rev_ttm / 1000.0
+                        _ni_ttm = _ttm["net_income"]
+                        if _ni_ttm.notna().all() and _rev_ttm:
+                            if pd.isna(_peer_df.at[_i, "純利益率 %"]):
+                                _peer_df.at[_i, "純利益率 %"] = \
+                                    float(_ni_ttm.sum()) / _rev_ttm * 100.0
+                        _op_ttm = _ttm["operating_income"]
+                        if _op_ttm.notna().all() and _rev_ttm:
+                            if pd.isna(_peer_df.at[_i, "営業利益率 %"]):
+                                _peer_df.at[_i, "営業利益率 %"] = \
+                                    float(_op_ttm.sum()) / _rev_ttm * 100.0
+
+                # 取得できなかった銘柄があれば明示する（無言でN/Aにしない）
+                _failed = _peer_df.loc[
+                    _peer_df[_num_cols].isna().all(axis=1), "ティッカー"].tolist()
+                if _failed:
+                    st.warning(
+                        "次の銘柄は Yahoo Finance から指標を取得できませんでした: "
+                        + "、".join(_failed)
+                        + "。一時的なレート制限の可能性があるため、"
+                        "少し時間をおいて再実行すると取得できることがあります。",
+                        icon="⚠️",
+                    )
+
                 def _highlight_parr(row):
                     is_self = row["ティッカー"] == ticker.upper()
                     style = ("background-color: #D9E9F7; font-weight: bold;"
@@ -2630,20 +2740,52 @@ if st.session_state.get("filings"):
             if _peer_px is not None and not _peer_px.empty:
                 import plotly.graph_objects as go
                 _pfig = go.Figure()
+                # 色は _OIL_PEERS の並び順で固定割り当てし、分析対象は常にスロット1。
+                # 銘柄が増減しても他社の色が入れ替わらないようにする。
+                _peer_order = [t for t, _, _ in _OIL_PEERS]
+                _color_of = {}
+                for _i, _t in enumerate([ticker.upper()]
+                                        + [t for t in _peer_order if t != ticker.upper()]):
+                    _color_of[_t] = _SERIES_COLORS[_i % len(_SERIES_COLORS)]
+
+                _plot_h = 460
                 for _col_name in _peer_px.columns:
-                    _is_self = str(_col_name).upper() == ticker.upper()
+                    _nm = str(_col_name).upper()
+                    _is_self = _nm == ticker.upper()
                     _pfig.add_trace(go.Scatter(
                         x=_peer_px.index, y=_peer_px[_col_name].round(1),
-                        name=str(_col_name),
-                        line=dict(width=3 if _is_self else 1.2,
-                                  color="#1F4E79" if _is_self else None),
-                        opacity=1.0 if _is_self else 0.65,
-                        hovertemplate="%{x|%Y-%m-%d}<br>" + str(_col_name)
+                        name=_nm,
+                        line=dict(width=3.2 if _is_self else 1.8,
+                                  color=_color_of.get(_nm, "#6B7280")),
+                        opacity=1.0,
+                        hovertemplate="%{x|%Y-%m-%d}<br>" + _nm
                                       + ": %{y:+.1f}%<extra></extra>",
                     ))
+
+                # 線の右端に社名を直接表示（凡例だけだと8本の識別が難しいため）。
+                # 重なりを避けるため、最終値の降順に最小間隔を確保して縦にずらす。
+                _finals = [(str(c).upper(), float(_peer_px[c].dropna().iloc[-1]))
+                           for c in _peer_px.columns if _peer_px[c].notna().any()]
+                if _finals:
+                    _finals.sort(key=lambda kv: kv[1], reverse=True)
+                    _ys = [v for _, v in _finals]
+                    _span = max(max(_ys) - min(_ys), 1e-9)
+                    _px_per_unit = (_plot_h - 90) / _span     # 描画領域の概算
+                    _min_gap_px, _last_px = 15.0, None
+                    _x_end = _peer_px.index[-1]
+                    for _nm, _val in _finals:
+                        _pos = (max(_ys) - _val) * _px_per_unit   # 上端からの距離(px)
+                        _adj = _pos if _last_px is None else max(_pos, _last_px + _min_gap_px)
+                        _last_px = _adj
+                        _pfig.add_annotation(
+                            x=_x_end, y=_val, text=f"<b>{_nm}</b>",
+                            showarrow=False, xanchor="left", xshift=8,
+                            yshift=-(_adj - _pos),
+                            font=dict(size=11, color=_color_of.get(_nm, "#6B7280")),
+                        )
                 _pfig.update_layout(
-                    height=380,
-                    margin=dict(l=0, r=0, t=10, b=0),
+                    height=_plot_h,
+                    margin=dict(l=0, r=70, t=10, b=0),   # 右端の直接ラベル用に余白
                     legend=dict(orientation="h", yanchor="bottom", y=1.01,
                                 xanchor="right", x=1),
                     hovermode="x unified",
@@ -2656,8 +2798,12 @@ if st.session_state.get("filings"):
                 )
                 st.markdown("### 📈 過去3年間の株価パフォーマンス比較")
                 st.plotly_chart(_pfig, use_container_width=True)
-                st.caption(f"※ 太い濃紺の線が {ticker.upper()} です。全銘柄とも表示期間の"
-                           "開始日を0%として指数化しています。")
+                st.caption(
+                    f"※ 各線の右端に銘柄名を直接表示しています（{ticker.upper()} は太線）。"
+                    "全銘柄とも表示期間の開始日を0%として指数化しています。"
+                    "凡例をクリックすると個別に表示/非表示を切り替えられ、"
+                    "ダブルクリックでその銘柄だけを表示できます。"
+                )
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
         _bs_df = build_bs_df(bs)
