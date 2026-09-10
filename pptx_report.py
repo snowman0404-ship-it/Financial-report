@@ -63,22 +63,29 @@ def _set_runs(paragraph, text: str, rgb: tuple | None = None) -> None:
         runs[0].font.color.rgb = RGBColor(*rgb)
 
 
-def _clear_table_fill(table) -> None:
-    """表の塗りつぶしを全て解除して背景を透明にする。
+def _clear_table_fill(table, keep: set | None = None) -> None:
+    """表の塗りつぶしを解除して背景を透明にする。
 
     セル個別に「塗りつぶしなし」を指定するだけでなく、テーブルスタイル側の
     見出し行/縞模様/先頭列の強調フラグも落とす。これらが立っていると
     スタイル由来の色がセル指定より優先されて残ることがあるため。
+
+    keep に (行, 列) を渡したセルは触らず、テンプレートの塗りをそのまま残す
+    （「今期」の紺、「合計」のオレンジなど、意図的に色を付けている見出し）。
+    keep 対象の色は tcPr に直接書かれた solidFill なので、上のスタイルフラグを
+    落としても影響を受けない。
     """
-    tbl = table._tbl
-    tbl_pr = tbl.find(
+    keep = keep or set()
+    tbl_pr = table._tbl.find(
         "{http://schemas.openxmlformats.org/drawingml/2006/main}tblPr")
     if tbl_pr is not None:
         for flag in ("firstRow", "lastRow", "firstCol", "lastCol",
                      "bandRow", "bandCol"):
             tbl_pr.set(flag, "0")
-    for row in table.rows:
-        for cell in row.cells:
+    for ri, row in enumerate(table.rows):
+        for ci, cell in enumerate(row.cells):
+            if (ri, ci) in keep:
+                continue
             cell.fill.background()          # <a:noFill/> を書き込む
 
 
@@ -295,9 +302,14 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
     for sh in s2.shapes:
         _replace_in_shape(sh, title_map)
 
+    # B/S側の表は原則として背景を塗らない。ただし「今期」ヘッダ（紺）と
+    # 「合計」（オレンジ）はテンプレートの色を残す。
+    # 表1(BS概要) の r0 は c0+c1 / c2+c3 が結合されているため両方を指定する。
+    _keep = {0: {(0, 2), (0, 3)},           # BS概要: 「今期」ヘッダ
+             1: {(0, 2), (4, 0)}}           # 内訳:   「今期」ヘッダ・「合計」
     tables2 = [sh.table for sh in s2.shapes if sh.has_table]
-    for _t in tables2:                      # B/S側の表は背景を塗らない
-        _clear_table_fill(_t)
+    for _i, _t in enumerate(tables2):
+        _clear_table_fill(_t, keep=_keep.get(_i, set()))
     t2 = tables2[0]
 
     cash_c = _bs_value(bs, "Cash", "current")
