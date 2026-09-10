@@ -84,6 +84,158 @@ def _get_chart_data(ticker: str):
     return stock, sp500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 市況データ（原油価格・クラックスプレッド）／ 同業他社比較  ※PARR向け
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 3-2-1 クラックスプレッド算出に使う先物ティッカー（yfinance）
+_CRACK_SYMBOLS = {"crude": "CL=F", "gasoline": "RB=F", "distillate": "HO=F"}
+_GAL_PER_BBL = 42.0
+
+# 米国石油セクターの比較対象（独立系製油 ＋ 総合石油メジャー）
+_OIL_PEERS = (
+    ("PARR", "Par Pacific Holdings", "独立系製油"),
+    ("VLO",  "Valero Energy",        "独立系製油"),
+    ("MPC",  "Marathon Petroleum",   "独立系製油"),
+    ("PSX",  "Phillips 66",          "独立系製油"),
+    ("DK",   "Delek US Holdings",    "独立系製油"),
+    ("CVI",  "CVR Energy",           "独立系製油"),
+    ("XOM",  "Exxon Mobil",          "総合石油"),
+    ("CVX",  "Chevron",              "総合石油"),
+)
+
+
+def _quarter_labels_from_index(idx) -> list:
+    return [f"{d.year}Q{d.quarter}" for d in idx]
+
+
+def _to_naive_index(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_market_conditions(years: int = 3) -> pd.DataFrame:
+    """WTI原油価格と 3-2-1 クラックスプレッドを四半期平均で返す。
+
+    3-2-1 クラックスプレッド（$/bbl）は製油業の標準的な採算指標で、
+    「原油3バレルからガソリン2バレル・留出油1バレルを精製する」想定のマージン:
+
+        crack = (2×ガソリン + 1×留出油 − 3×原油) ÷ 3
+
+    ガソリン(RB=F)・留出油(HO=F)は $/ガロン建てのため 42 倍して $/bbl に換算する。
+    取得できない場合は空のDataFrameを返す（呼び出し側でスキップ）。
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return pd.DataFrame()
+    try:
+        raw = yf.download(list(_CRACK_SYMBOLS.values()), period=f"{years + 1}y",
+                          interval="1d", progress=False, auto_adjust=False)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or getattr(raw, "empty", True):
+        return pd.DataFrame()
+
+    try:
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+        cl = pd.to_numeric(close[_CRACK_SYMBOLS["crude"]],      errors="coerce")
+        rb = pd.to_numeric(close[_CRACK_SYMBOLS["gasoline"]],   errors="coerce")
+        ho = pd.to_numeric(close[_CRACK_SYMBOLS["distillate"]], errors="coerce")
+    except Exception:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        "wti":   cl,
+        "crack": (2 * rb * _GAL_PER_BBL + ho * _GAL_PER_BBL - 3 * cl) / 3.0,
+    }).dropna()
+    if df.empty:
+        return pd.DataFrame()
+
+    df = _to_naive_index(df)
+    try:
+        q = df.resample("QE").mean()          # pandas 2.2+
+    except ValueError:
+        q = df.resample("Q").mean()           # 旧pandas
+    q = q.dropna()
+    if q.empty:
+        return pd.DataFrame()
+    out = q.reset_index(drop=True)
+    out["quarter_label"] = _quarter_labels_from_index(q.index)
+    return out[["quarter_label", "wti", "crack"]]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_peer_metrics(peers: tuple) -> pd.DataFrame:
+    """同業他社の規模・収益性・バリュエーション指標を yfinance からまとめて取得する。"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return pd.DataFrame()
+    import math
+
+    rows = []
+    for ticker, name, group in peers:
+        info = {}
+        try:
+            info = yf.Ticker(ticker).info or {}
+        except Exception:
+            pass
+
+        def _num(key, scale=1.0):
+            try:
+                v = float(info.get(key))
+                return None if math.isnan(v) else v * scale
+            except (TypeError, ValueError):
+                return None
+
+        rows.append({
+            "ティッカー": ticker,
+            "会社名": name,
+            "区分": group,
+            "時価総額 [USD B]":   _num("marketCap", 1e-9),
+            "売上高TTM [USD B]": _num("totalRevenue", 1e-9),
+            "営業利益率 %":       _num("operatingMargins", 100.0),
+            "純利益率 %":         _num("profitMargins", 100.0),
+            "PER":               _num("trailingPE"),
+            "PBR":               _num("priceToBook"),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _get_peer_prices(tickers: tuple, years: int = 3) -> pd.DataFrame:
+    """同業他社の株価を一括取得し、期間開始日=0% として指数化した騰落率を返す。"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return pd.DataFrame()
+    try:
+        raw = yf.download(list(tickers), period=f"{years}y", interval="1wk",
+                          progress=False, auto_adjust=True)
+    except Exception:
+        return pd.DataFrame()
+    if raw is None or getattr(raw, "empty", True):
+        return pd.DataFrame()
+    try:
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
+    except Exception:
+        return pd.DataFrame()
+
+    close = _to_naive_index(pd.DataFrame(close)).dropna(how="all")
+    if close.empty:
+        return pd.DataFrame()
+    # 全銘柄が揃っている最初の日を基準に指数化（比較の基準日を揃える）
+    close = close.dropna()
+    if close.empty:
+        return pd.DataFrame()
+    return (close / close.iloc[0] - 1.0) * 100.0
+
+
 def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
     """Compute PER/PBR with 3-level fallback.
 
@@ -930,12 +1082,35 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
     return result
 
 
+def _trend_period_values(facts: dict, candidates: list, eff_q: int,
+                         target: datetime) -> tuple:
+    """対象期の (3ヶ月単独値, YTD値) を返す。
+
+    企業によって開示の仕方が2通りある:
+      A) 3ヶ月単独の期間ファクトを付けている（XOM等）→ そのまま四半期の値として使える
+      B) 累積(YTD)しか付けていない（PARR等）      → 前四半期までの累積を引く必要がある
+    どちらでも正しく扱えるよう、両方を取得して呼び出し側で使い分ける。
+    """
+    def _pick(quarter_num: int, tol: int):
+        _, _, recs = _best_ytd_tag(facts, candidates, quarter_num, target)
+        recs = _dedup_latest(recs, 100)
+        rec = _find_closest(recs, target, tol) if recs else None
+        return rec.get("val") if rec else None
+
+    direct = _pick(1, 45)                      # 3ヶ月単独（75〜110日）
+    ytd    = _pick(eff_q, 65) if eff_q != 1 else direct
+    return direct, ytd
+
+
 def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.DataFrame:
     """決算期リスト（最大24期）から、過去N年分の「四半期単独」の売上高・純利益を算出する
-    （全企業対象）。10-Qは累積(YTD)値、10-Kは通期値として開示されるため、前の四半期までの
-    累積値を差し引く de-cumulation を行う（例: Q2単独 = 6ヶ月累積 − Q1）。
-    タグ候補はPARR用・一般企業用を統合したものを使い、期ごとに対象期に最も近い
-    レコードを持つタグを選ぶため、年度途中でタグを切り替えた企業にも追従できる。
+    （全企業対象）。
+
+    3ヶ月単独の期間ファクトが開示されていればそれをそのまま使い、累積(YTD)しか
+    無い企業についてのみ、前の四半期までの累積値を差し引く de-cumulation を行う
+    （例: Q2単独 = 6ヶ月累積 − Q1）。タグ候補はPARR用・一般企業用を統合したものを使い、
+    期ごとに対象期に最も近いレコードを持つタグを選ぶため、年度途中でタグを
+    切り替えた企業にも追従できる。
     直近フィリングの期末日を基準に過去N年分に絞り込んで返す。
     """
     ordered = sorted(
@@ -952,24 +1127,21 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
         eff_q  = 4 if form == "10-K" else q_num
         target = datetime.strptime(period, "%Y-%m-%d")
 
-        _, _, rev_recs = _best_ytd_tag(facts, _TREND_REVENUE_TAGS, eff_q, target)
-        _, _, ni_recs  = _best_ytd_tag(facts, _TREND_NETINCOME_TAGS, eff_q, target)
-        rev_recs = _dedup_latest(rev_recs, 100)
-        ni_recs  = _dedup_latest(ni_recs, 100)
-        rev_rec  = _find_closest(rev_recs, target, 65) if rev_recs else None
-        ni_rec   = _find_closest(ni_recs, target, 65) if ni_recs else None
-        ytd_rev  = rev_rec.get("val") if rev_rec else None
-        ytd_ni   = ni_rec.get("val")  if ni_rec  else None
+        direct_rev, ytd_rev = _trend_period_values(facts, _TREND_REVENUE_TAGS, eff_q, target)
+        direct_ni,  ytd_ni  = _trend_period_values(facts, _TREND_NETINCOME_TAGS, eff_q, target)
 
-        # 四半期単独値 = 当YTD − 前四半期までのYTD（Q1、または直前データが無い場合はYTDそのまま）
-        if eff_q == 1 or prev_rev is None:
-            q_rev = ytd_rev
-        else:
-            q_rev = (ytd_rev - prev_rev) if (ytd_rev is not None and prev_rev is not None) else None
-        if eff_q == 1 or prev_ni is None:
-            q_ni = ytd_ni
-        else:
-            q_ni = (ytd_ni - prev_ni) if (ytd_ni is not None and prev_ni is not None) else None
+        def _resolve(direct, ytd, prev):
+            # 3ヶ月単独の開示があればそのまま採用。無ければYTDから差し引いて算出。
+            if direct is not None:
+                return direct
+            if ytd is None:
+                return None
+            if eff_q == 1 or prev is None:
+                return ytd
+            return ytd - prev
+
+        q_rev = _resolve(direct_rev, ytd_rev, prev_rev)
+        q_ni  = _resolve(direct_ni,  ytd_ni,  prev_ni)
 
         prev_rev, prev_ni = ytd_rev, ytd_ni
 
@@ -2289,6 +2461,203 @@ if st.session_state.get("filings"):
             )
         else:
             st.info("四半期トレンドデータを算出できませんでした。")
+
+        # ── PARR限定: 市況（原油価格・クラックスプレッド）との重ね合わせ ──────
+        if is_parr and trend_df is not None and not trend_df.empty:
+            st.markdown("---")
+            st.markdown("## 🛢️ 市況との重ね合わせ — 原油価格・クラックスプレッド vs 業績")
+            st.caption(
+                "精製業の採算は「原油をいくらで仕入れ、製品をいくらで売れるか」の差＝"
+                "クラックスプレッドで決まります。3-2-1クラックスプレッド（原油3バレルから"
+                "ガソリン2バレル・留出油1バレルを精製する想定のマージン、$/バレル）を"
+                "四半期平均で算出し、同じ期間の四半期純利益と重ねています。"
+            )
+            with st.spinner("原油・製品先物データを取得中…"):
+                _mkt = _get_market_conditions(years=3)
+
+            if _mkt is not None and not _mkt.empty:
+                _merged = trend_df.merge(_mkt, on="quarter_label", how="left")
+                if _merged["crack"].notna().any():
+                    import plotly.graph_objects as go
+                    _mfig = go.Figure()
+                    _mfig.add_trace(go.Scatter(
+                        x=_merged["quarter_label"], y=_merged["crack"].round(1),
+                        name="3-2-1 クラックスプレッド ($/bbl)", mode="lines+markers",
+                        line=dict(color="#D97706", width=2.5), marker=dict(size=7),
+                        yaxis="y1",
+                        hovertemplate="%{x}<br>クラックスプレッド: $%{y:,.1f}/bbl<extra></extra>",
+                    ))
+                    _mfig.add_trace(go.Scatter(
+                        x=_merged["quarter_label"], y=_merged["wti"].round(1),
+                        name="WTI原油価格 ($/bbl)", mode="lines+markers",
+                        line=dict(color="#6B7280", width=1.5, dash="dot"), marker=dict(size=5),
+                        yaxis="y1",
+                        hovertemplate="%{x}<br>WTI: $%{y:,.1f}/bbl<extra></extra>",
+                    ))
+                    _mfig.add_trace(go.Scatter(
+                        x=_merged["quarter_label"], y=_merged["net_income"].round(1),
+                        name="四半期純利益 (USD M)", mode="lines+markers",
+                        line=dict(color="#16A34A", width=2.5), marker=dict(size=7),
+                        yaxis="y2",
+                        hovertemplate="%{x}<br>純利益: $%{y:,.1f}M<extra></extra>",
+                    ))
+                    _mfig.update_layout(
+                        height=380,
+                        margin=dict(l=0, r=0, t=10, b=0),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                                    xanchor="right", x=1),
+                        hovermode="x unified",
+                        plot_bgcolor="white", paper_bgcolor="white",
+                        xaxis=dict(showgrid=False, zeroline=False, title="決算期"),
+                        yaxis=dict(
+                            title="市況 ($/bbl)", title_font_color="#D97706",
+                            tickfont=dict(color="#D97706"), showgrid=True,
+                            gridcolor="#F3F4F6", zeroline=False,
+                        ),
+                        yaxis2=dict(
+                            title="四半期純利益 (USD M)", title_font_color="#16A34A",
+                            tickfont=dict(color="#16A34A"), overlaying="y", side="right",
+                            showgrid=False, zeroline=True, zerolinecolor="#E5E7EB",
+                        ),
+                    )
+                    st.plotly_chart(_mfig, use_container_width=True)
+
+                    # 市況と業績の連動性を数値でも示す
+                    _pair = _merged[["crack", "net_income"]].dropna()
+                    if len(_pair) >= 3:
+                        _corr = _pair["crack"].corr(_pair["net_income"])
+                        _peak = _merged.loc[_merged["crack"].idxmax()] \
+                            if _merged["crack"].notna().any() else None
+                        _c1, _c2, _c3 = st.columns(3)
+                        _c1.metric("クラックスプレッドと純利益の相関",
+                                   f"{_corr:+.2f}" if pd.notna(_corr) else "N/A",
+                                   help="+1に近いほど市況と業績が連動。0.7以上なら業績は市況要因が支配的。")
+                        if _peak is not None and pd.notna(_peak.get("crack")):
+                            _c2.metric("市況ピーク時期",
+                                       str(_peak["quarter_label"]),
+                                       help="表示期間中でクラックスプレッドが最も高かった四半期")
+                            _c3.metric("同四半期のクラックスプレッド",
+                                       f"${_peak['crack']:,.1f}/bbl")
+                        if pd.notna(_corr):
+                            if _corr >= 0.7:
+                                st.success(
+                                    f"✅ 相関 {_corr:+.2f} — この期間の純利益はクラックスプレッド"
+                                    "（市況）とほぼ連動しています。好業績は市況要因の寄与が大きいと読めます。",
+                                    icon="🛢️")
+                            elif _corr >= 0.3:
+                                st.info(
+                                    f"相関 {_corr:+.2f} — 市況とある程度連動しますが、"
+                                    "市況以外の要因（数量・コスト・一時要因）も効いています。", icon="🛢️")
+                            else:
+                                st.info(
+                                    f"相関 {_corr:+.2f} — この期間の業績は市況との連動が弱く、"
+                                    "個社要因の影響が大きい可能性があります。", icon="🛢️")
+                    st.caption(
+                        "※ クラックスプレッドは WTI原油(CL=F)・RBOBガソリン(RB=F)・"
+                        "ULSD留出油(HO=F)の日次終値から算出した四半期平均の概算値です。"
+                        "実際の製油所の採算は地域・原油種・製品構成により異なります"
+                        "（PARRはハワイ・ワイオミング等が拠点のため、指標としての参考値）。"
+                    )
+                else:
+                    st.info("対象四半期に対応する市況データを取得できませんでした。")
+            else:
+                st.info("市況データ（原油・製品先物）を取得できませんでした。")
+
+        # ── PARR限定: 米国石油セクター 同業他社比較 ────────────────────
+        if is_parr:
+            st.markdown("---")
+            st.markdown("## ⛽ 米国石油セクター 同業他社比較")
+            st.caption(
+                "独立系製油（PARR・VLO・MPC・PSX・DK・CVI）と総合石油メジャー（XOM・CVX）を"
+                "横並びで比較します。指標は Yahoo Finance の直近値（TTM）です。"
+            )
+            with st.spinner("同業他社の指標を取得中…（初回は10〜30秒かかります）"):
+                _peer_df = _get_peer_metrics(_OIL_PEERS)
+
+            if _peer_df is not None and not _peer_df.empty:
+                _num_cols = ["時価総額 [USD B]", "売上高TTM [USD B]",
+                             "営業利益率 %", "純利益率 %", "PER", "PBR"]
+
+                def _highlight_parr(row):
+                    is_self = row["ティッカー"] == ticker.upper()
+                    style = ("background-color: #D9E9F7; font-weight: bold;"
+                             if is_self else "")
+                    return pd.Series([style] * len(row), index=row.index)
+
+                _fmt = {c: (lambda v: "N/A" if pd.isna(v) else f"{v:,.1f}")
+                        for c in _num_cols}
+                st.dataframe(
+                    _peer_df.style
+                        .apply(_highlight_parr, axis=1)
+                        .format(_fmt, na_rep="N/A"),
+                    width="stretch",
+                    height=min(420, 60 + 35 * len(_peer_df)),
+                )
+
+                # PARRの相対位置を明示
+                _self_row = _peer_df[_peer_df["ティッカー"] == ticker.upper()]
+                _others   = _peer_df[_peer_df["ティッカー"] != ticker.upper()]
+                if not _self_row.empty:
+                    _s = _self_row.iloc[0]
+                    _cols = st.columns(3)
+                    for _col, _metric, _fmt_str, _lower_better in (
+                        (_cols[0], "純利益率 %", "{:.1f}%", False),
+                        (_cols[1], "PER",       "{:.1f}倍", True),
+                        (_cols[2], "PBR",       "{:.1f}倍", True),
+                    ):
+                        _v = _s.get(_metric)
+                        _peer_med = pd.to_numeric(_others[_metric], errors="coerce").median()
+                        if pd.notna(_v) and pd.notna(_peer_med):
+                            _diff = _v - _peer_med
+                            # delta は数値で始まる文字列にする（先頭が文字だと
+                            # Streamlit が増減方向を判定できず常に緑↑になるため）
+                            _col.metric(
+                                f"{ticker.upper()} の {_metric}",
+                                _fmt_str.format(_v),
+                                delta=f"{_diff:+.1f}",
+                                delta_color=("inverse" if _lower_better else "normal"),
+                                help=f"他社中央値（{_peer_med:,.1f}）との差。"
+                                     + ("低いほど割安。" if _lower_better else "高いほど良好。"),
+                            )
+                        else:
+                            _col.metric(f"{ticker.upper()} の {_metric}", "N/A")
+            else:
+                st.info("同業他社の指標を取得できませんでした（ネットワーク制限の可能性があります）。")
+
+            # 株価パフォーマンスの横並び（期間開始日=0%で指数化）
+            with st.spinner("同業他社の株価推移を取得中…"):
+                _peer_px = _get_peer_prices(tuple(t for t, _, _ in _OIL_PEERS), years=3)
+            if _peer_px is not None and not _peer_px.empty:
+                import plotly.graph_objects as go
+                _pfig = go.Figure()
+                for _col_name in _peer_px.columns:
+                    _is_self = str(_col_name).upper() == ticker.upper()
+                    _pfig.add_trace(go.Scatter(
+                        x=_peer_px.index, y=_peer_px[_col_name].round(1),
+                        name=str(_col_name),
+                        line=dict(width=3 if _is_self else 1.2,
+                                  color="#1F4E79" if _is_self else None),
+                        opacity=1.0 if _is_self else 0.65,
+                        hovertemplate="%{x|%Y-%m-%d}<br>" + str(_col_name)
+                                      + ": %{y:+.1f}%<extra></extra>",
+                    ))
+                _pfig.update_layout(
+                    height=380,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                                xanchor="right", x=1),
+                    hovermode="x unified",
+                    plot_bgcolor="white", paper_bgcolor="white",
+                    xaxis=dict(showgrid=False, zeroline=False),
+                    yaxis=dict(title="騰落率 (%)　※期間開始日を0%として指数化",
+                               showgrid=True, gridcolor="#F3F4F6",
+                               zeroline=True, zerolinecolor="#9CA3AF",
+                               ticksuffix="%"),
+                )
+                st.markdown("### 📈 過去3年間の株価パフォーマンス比較")
+                st.plotly_chart(_pfig, use_container_width=True)
+                st.caption(f"※ 太い濃紺の線が {ticker.upper()} です。全銘柄とも表示期間の"
+                           "開始日を0%として指数化しています。")
 
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
         _bs_df = build_bs_df(bs)
