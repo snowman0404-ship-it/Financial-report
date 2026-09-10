@@ -233,10 +233,10 @@ def _get_peer_metrics(peers: tuple) -> pd.DataFrame:
             "ティッカー": ticker,
             "会社名": name,
             "区分": group,
-            "時価総額 [USD B]":   _num("marketCap", 1e-9),
+            "時価総額 [USD B]（現在）":   _num("marketCap", 1e-9),
             "売上高TTM [USD B]": _num("totalRevenue", 1e-9),
-            "営業利益率 %":       _num("operatingMargins", 100.0),
-            "純利益率 %":         _num("profitMargins", 100.0),
+            "営業利益率TTM %":       _num("operatingMargins", 100.0),
+            "純利益率TTM %":         _num("profitMargins", 100.0),
             "PER":               _num("trailingPE"),
             "PBR":               _num("priceToBook"),
         })
@@ -2646,14 +2646,19 @@ if st.session_state.get("filings"):
             st.markdown("## ⛽ 米国石油セクター 同業他社比較")
             st.caption(
                 "独立系製油（PARR・VLO・MPC・PSX・DK・CVI）と総合石油メジャー（XOM・CVX）を"
-                "横並びで比較します。指標は Yahoo Finance の直近値（TTM）です。"
+                "横並びで比較します。**年度累計ではありません**。"
+                "売上高・利益率は各社が直近に報告した決算までの **TTM（直近12ヶ月）**、"
+                "時価総額・PER・PBR は**現在の株価**に基づく値です（PERはTTM EPS基準、"
+                "PBRは直近四半期末の純資産基準）。決算発表のタイミングが各社で異なるため、"
+                "TTMの期間が1四半期ずれる場合があります。出所は Yahoo Finance"
+                "（分析対象社は取得できない場合 SEC EDGAR の直近4四半期で補完）。"
             )
             with st.spinner("同業他社の指標を取得中…（初回は10〜30秒かかります）"):
                 _peer_df = _get_peer_metrics(_OIL_PEERS)
 
             if _peer_df is not None and not _peer_df.empty:
-                _num_cols = ["時価総額 [USD B]", "売上高TTM [USD B]",
-                             "営業利益率 %", "純利益率 %", "PER", "PBR"]
+                _num_cols = ["時価総額 [USD B]（現在）", "売上高TTM [USD B]",
+                             "営業利益率TTM %", "純利益率TTM %", "PER", "PBR"]
 
                 # Yahoo Finance が自社分を返さなかった場合、既に取得済みの
                 # SEC EDGARデータ（直近4四半期＝TTM）で補完する。
@@ -2667,13 +2672,13 @@ if st.session_state.get("filings"):
                             _peer_df.at[_i, "売上高TTM [USD B]"] = _rev_ttm / 1000.0
                         _ni_ttm = _ttm["net_income"]
                         if _ni_ttm.notna().all() and _rev_ttm:
-                            if pd.isna(_peer_df.at[_i, "純利益率 %"]):
-                                _peer_df.at[_i, "純利益率 %"] = \
+                            if pd.isna(_peer_df.at[_i, "純利益率TTM %"]):
+                                _peer_df.at[_i, "純利益率TTM %"] = \
                                     float(_ni_ttm.sum()) / _rev_ttm * 100.0
                         _op_ttm = _ttm["operating_income"]
                         if _op_ttm.notna().all() and _rev_ttm:
-                            if pd.isna(_peer_df.at[_i, "営業利益率 %"]):
-                                _peer_df.at[_i, "営業利益率 %"] = \
+                            if pd.isna(_peer_df.at[_i, "営業利益率TTM %"]):
+                                _peer_df.at[_i, "営業利益率TTM %"] = \
                                     float(_op_ttm.sum()) / _rev_ttm * 100.0
 
                 # 取得できなかった銘柄があれば明示する（無言でN/Aにしない）
@@ -2711,7 +2716,7 @@ if st.session_state.get("filings"):
                     _s = _self_row.iloc[0]
                     _cols = st.columns(3)
                     for _col, _metric, _fmt_str, _lower_better in (
-                        (_cols[0], "純利益率 %", "{:.1f}%", False),
+                        (_cols[0], "純利益率TTM %", "{:.1f}%", False),
                         (_cols[1], "PER",       "{:.1f}倍", True),
                         (_cols[2], "PBR",       "{:.1f}倍", True),
                     ):
