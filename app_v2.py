@@ -2218,16 +2218,20 @@ if st.session_state.get("filings"):
             if _stock is not None and not _stock.empty:
                 import plotly.graph_objects as go
                 _fig = go.Figure()
-                # ── 企業株価（左軸） ──
+                # 両系列とも「表示期間の開始日=0%」で指数化し、同一軸上の騰落率として
+                # 表示する（絶対株価とS&P500の%騰落率を別軸で表示すると、下落局面での
+                # 相対的な下落幅＝暴落率の比較ができないため、単位を統一）。
+                _stock_pct = (_stock["Close"] / _stock["Close"].iloc[0] - 1) * 100
                 _fig.add_trace(go.Scatter(
                     x=_stock.index,
-                    y=_stock["Close"].round(2),
-                    name=f"{ticker.upper()} 株価",
-                    line=dict(color="#2563EB", width=1.5),
-                    yaxis="y1",
-                    hovertemplate="%{x|%Y-%m-%d}<br>株価: $%{y:,.2f}<extra></extra>",
+                    y=_stock_pct.round(2),
+                    name=f"{ticker.upper()} 騰落率",
+                    line=dict(color="#2563EB", width=1.8),
+                    customdata=_stock[["Close"]].values,
+                    hovertemplate=("%{x|%Y-%m-%d}<br>" + ticker.upper() +
+                                    ": %{y:+.1f}%（$%{customdata[0]:,.2f}）<extra></extra>"),
                 ))
-                # ── S&P500 騰落率（右軸）※取得できた場合のみ ──
+                # ── S&P500 騰落率（同一軸）※取得できた場合のみ ──
                 if _sp500 is not None and not _sp500.empty:
                     _sp_pct = (_sp500["Close"] / _sp500["Close"].iloc[0] - 1) * 100
                     _fig.add_trace(go.Scatter(
@@ -2235,10 +2239,8 @@ if st.session_state.get("filings"):
                         y=_sp_pct.round(2),
                         name="S&P500 騰落率",
                         line=dict(color="#9CA3AF", width=1.5, dash="dot"),
-                        yaxis="y2",
                         hovertemplate="%{x|%Y-%m-%d}<br>S&P500: %{y:+.1f}%<extra></extra>",
                     ))
-                # 共通レイアウト（titlefont は Plotly 5.x で廃止 → title_font を使用）
                 _fig.update_layout(
                     height=340,
                     margin=dict(l=0, r=0, t=10, b=0),
@@ -2249,30 +2251,22 @@ if st.session_state.get("filings"):
                     paper_bgcolor="white",
                     xaxis=dict(showgrid=False, zeroline=False),
                     yaxis=dict(
-                        title=f"{ticker.upper()} 株価 (USD)",
-                        title_font_color="#2563EB",
-                        tickfont=dict(color="#2563EB"),
+                        title="騰落率 (%)　※期間開始日を0%として指数化",
                         showgrid=True,
                         gridcolor="#F3F4F6",
-                        zeroline=False,
+                        zeroline=True,
+                        zerolinecolor="#9CA3AF",
+                        zerolinewidth=1,
+                        ticksuffix="%",
                     ),
                 )
-                # 右軸は S&P500 取得時のみ追加
-                if _sp500 is not None and not _sp500.empty:
-                    _fig.update_layout(
-                        yaxis2=dict(
-                            title="S&P500 騰落率 (%)",
-                            title_font_color="#9CA3AF",
-                            tickfont=dict(color="#9CA3AF"),
-                            overlaying="y",
-                            side="right",
-                            showgrid=False,
-                            zeroline=True,
-                            zerolinecolor="#E5E7EB",
-                            ticksuffix="%",
-                        )
-                    )
                 st.plotly_chart(_fig, use_container_width=True)
+                st.caption(
+                    f"※ {ticker.upper()}とS&P500はいずれも表示期間の開始日を基準（0%）とした"
+                    "騰落率で表示しています。同じ軸で比較できるため、下落局面での相対的な"
+                    "下落幅（暴落率の比較）を直接読み取れます。実際の株価（$）はグラフに"
+                    "マウスを合わせると表示されます。"
+                )
             else:
                 st.info("株価データを取得できませんでした（ネットワーク制限の可能性があります）")
 
