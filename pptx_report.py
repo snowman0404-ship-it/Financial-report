@@ -20,18 +20,16 @@ from pathlib import Path
 TEMPLATE_PATH = Path(__file__).with_name("templates") / "parr_report_template.pptx"
 
 # テンプレート注記「成績良化を青字、悪化を赤字で記載」に対応する色
-_GOOD_RGB = (0x1F, 0x4E, 0x79)      # 濃紺
-_BAD_RGB = (0xC0, 0x00, 0x00)       # 赤
-_PLAIN_RGB = (0x00, 0x00, 0x00)
+_PLAIN_RGB = (0x00, 0x00, 0x00)     # 前年度比の文字色（黒で統一）
 
-# P&L 行の並びと、増加が「悪化」を意味するか（費用系は増加＝悪化）
+# P&L 表の行の並び（テンプレートの行順と対応）
 _PL_ROWS = [
-    ("Revenues",            "売上高",       False),
-    ("OperatingExpenses",   "営業費用",     True),
-    ("OperatingIncomeLoss", "営業利益",     False),
-    ("InterestExpense",     "営業外費用",   True),
-    ("IncomeLossBeforeTax", "税引き前利益", False),
-    ("NetIncomeLoss",       "純利益",       False),
+    ("Revenues",            "売上高"),
+    ("OperatingExpenses",   "営業費用"),
+    ("OperatingIncomeLoss", "営業利益"),
+    ("InterestExpense",     "営業外費用"),
+    ("IncomeLossBeforeTax", "税引き前利益"),
+    ("NetIncomeLoss",       "純利益"),
 ]
 
 
@@ -260,25 +258,15 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
     _set_cell(t1, 0, 2, cur_y,   para=0)
     _set_cell(t1, 0, 2, cur_q,   para=1)
 
-    for i, (key, label, is_cost) in enumerate(_PL_ROWS, start=1):
+    for i, (key, label) in enumerate(_PL_ROWS, start=1):
         cur = _pl_value(pl, key, "current")
         pri = _pl_value(pl, key, "prior")
         diff = (cur - pri) if (cur is not None and pri is not None) else None
-        if key == "InterestExpense":
-            # 営業外損益は「符号付きの純額（マイナス＝費用）」で報告される場合と
-            # 「費用の絶対額（プラス）」で報告される場合がある。前者では値が
-            # 増える＝費用が減る＝良化なので、符号を見て良化方向を判定する。
-            _ref = cur if cur is not None else pri
-            is_cost = bool(_ref is not None and _ref > 0)
-        if diff is None:
-            rgb = _PLAIN_RGB
-        else:
-            improved = (diff < 0) if is_cost else (diff > 0)
-            rgb = _GOOD_RGB if improved else _BAD_RGB
         _set_cell(t1, i, 0, label)
         _set_cell(t1, i, 1, _fmt(pri))      # 左: 前年度
         _set_cell(t1, i, 2, _fmt(cur))      # 右: 最新
-        _set_cell(t1, i, 3, _fmt_signed(diff), rgb=rgb)
+        # 前年度比は良化/悪化で色分けせず、黒で統一する
+        _set_cell(t1, i, 3, _fmt_signed(diff), rgb=_PLAIN_RGB)
 
     # グラフ枠に売上高・株価チャートを差し込む
     frames = _find_chart_frames(s1)
