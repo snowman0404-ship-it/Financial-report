@@ -784,6 +784,64 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
     return result
 
 
+def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.DataFrame:
+    """PARR限定機能: 決算期リスト（最大24期）から、過去N年分の「四半期単独」の
+    売上高・純利益を算出する。10-Qは累積(YTD)値、10-Kは通期値として開示されるため、
+    前の四半期までの累積値を差し引く de-cumulation を行う（例: Q2単独 = 6ヶ月累積 − Q1）。
+    直近フィリングの期末日を基準に過去N年分に絞り込んで返す。
+    """
+    ordered = sorted(
+        [f for f in filings if f.get("form") in ("10-Q", "10-K") and f.get("period")],
+        key=lambda f: f["period"],
+    )
+    rows = []
+    prev_rev = prev_ni = None
+    for f in ordered:
+        period = f["period"]
+        form   = f.get("form", "10-Q")
+        fy_end = f.get("fy_end", "1231")
+        q_num  = _quarter_num(period, fy_end)
+        eff_q  = 4 if form == "10-K" else q_num
+        target = datetime.strptime(period, "%Y-%m-%d")
+
+        _, _, rev_recs = _best_ytd_tag(facts, PL_TAGS["Revenues"], eff_q)
+        _, _, ni_recs  = _best_ytd_tag(facts, PL_TAGS["NetIncomeLoss"], eff_q)
+        rev_recs = _dedup_latest(rev_recs, 100)
+        ni_recs  = _dedup_latest(ni_recs, 100)
+        rev_rec  = _find_closest(rev_recs, target, 65) if rev_recs else None
+        ni_rec   = _find_closest(ni_recs, target, 65) if ni_recs else None
+        ytd_rev  = rev_rec.get("val") if rev_rec else None
+        ytd_ni   = ni_rec.get("val")  if ni_rec  else None
+
+        # 四半期単独値 = 当YTD − 前四半期までのYTD（Q1、または直前データが無い場合はYTDそのまま）
+        if eff_q == 1 or prev_rev is None:
+            q_rev = ytd_rev
+        else:
+            q_rev = (ytd_rev - prev_rev) if (ytd_rev is not None and prev_rev is not None) else None
+        if eff_q == 1 or prev_ni is None:
+            q_ni = ytd_ni
+        else:
+            q_ni = (ytd_ni - prev_ni) if (ytd_ni is not None and prev_ni is not None) else None
+
+        prev_rev, prev_ni = ytd_rev, ytd_ni
+
+        rows.append({
+            "period": period, "period_dt": target, "form": form, "quarter_num": eff_q,
+            "quarter_label": f"{target.year}Q{eff_q}",
+            "revenue": _m(q_rev) if q_rev is not None else None,
+            "net_income": _m(q_ni) if q_ni is not None else None,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    latest = df["period_dt"].max()
+    cutoff = latest - timedelta(days=365 * years + 45)
+    df = df[df["period_dt"] >= cutoff].sort_values("period_dt").reset_index(drop=True)
+    return df
+
+
 def extract_bs(facts: dict, target_period: str | None = None) -> dict:
     target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
     result = {}
@@ -999,6 +1057,94 @@ def build_bs_df(bs: dict) -> pd.DataFrame:
                   [cl_c, ltl_c, eq_c], [cl_p, ltl_p, eq_p]),
     ]
     return pd.DataFrame(rows)
+
+
+def _classify_bs_tag(tag: str) -> str:
+    """B/Sタグ名から 資産/負債/資本 を簡易分類（キーワードベース）。"""
+    low = tag.lower()
+    if "liabilit" in low:
+        return "負債 / Liabilities"
+    equity_kw = (
+        "stockholdersequity", "partnerscapital", "memberscapital",
+        "retainedearnings", "additionalpaidincapital", "treasurystock",
+        "commonstockvalue", "preferredstockvalue",
+        "accumulatedothercomprehensiveincome", "minorityinterest",
+        "temporaryequity", "commonstocksincludingadditionalpaidincapital",
+    )
+    if any(k in low for k in equity_kw):
+        return "資本 / Equity"
+    return "資産 / Assets"
+
+
+def _prettify_tag(tag: str) -> str:
+    """CamelCase の XBRL タグ名を単語間スペース区切りに変換（可読性向上用）。"""
+    return re.sub(r"(?<!^)(?=[A-Z])", " ", tag)
+
+
+def extract_bs_full(facts: dict, target_period: str | None = None) -> pd.DataFrame:
+    """PARR限定機能: SEC XBRLで報告されている全てのUSD建て時点(instant)項目を、
+    対象決算期と前四半期で比較する。主要B/S科目に加え、注記(footnote)レベルの
+    内訳項目が含まれる場合がある。戻り値は build_bs_df() と同じ列構成（_style_df 互換）に
+    内部列 "_category" を加えたもの。
+    """
+    target = datetime.strptime(target_period, "%Y-%m-%d") if target_period else None
+    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+
+    raw_rows = []
+    for tag, tag_data in us_gaap.items():
+        recs = (tag_data.get("units", {}) or {}).get("USD")
+        if not recs:
+            continue
+        instants = _dedup_latest(_filter_instant(recs), 100)
+        if not instants:
+            continue
+        cur_rec = _find_closest(instants, target, 65) if target else instants[0]
+        if cur_rec is None or cur_rec.get("val") is None:
+            continue
+        cur_end = datetime.strptime(cur_rec["end"], "%Y-%m-%d")
+        prior_target = cur_end - timedelta(days=92)
+        others = [r for r in instants if r["end"] != cur_rec["end"]]
+        prior_rec = _find_closest(others, prior_target, 65)
+
+        raw_rows.append({
+            "tag": tag,
+            "category": _classify_bs_tag(tag),
+            "cur_val": cur_rec.get("val"),
+            "cur_date": cur_rec["end"],
+            "pri_val": prior_rec.get("val") if prior_rec else None,
+        })
+
+    if not raw_rows:
+        return pd.DataFrame()
+
+    from collections import Counter
+    canon_cur = Counter(r["cur_date"] for r in raw_rows).most_common(1)[0][0]
+    cur_col = f"当四半期末 ({canon_cur})\n[USD M]"
+    pri_col = "前四半期末\n[USD M]"
+
+    rows = []
+    for r in raw_rows:
+        cur   = round(_m(r["cur_val"])) if r["cur_val"] is not None else None
+        pri   = round(_m(r["pri_val"])) if r["pri_val"] is not None else None
+        delta = (cur - pri) if (cur is not None and pri is not None) else None
+        pct   = delta / abs(pri) if (delta is not None and pri not in (None, 0)) else None
+        is_liab = r["category"] == "負債 / Liabilities"
+        rows.append({
+            "項目 / Metric": f'{_prettify_tag(r["tag"])} ({r["tag"]})',
+            cur_col: cur, pri_col: pri,
+            "差額 [USD M]": delta, "変化率 %": _pct_label(pct, cur, pri, is_liab),
+            "_pct": pct, "_is_cost": is_liab, "_cur": cur, "_pri": pri,
+            "_tag": r["tag"], "_is_subtotal": False, "_category": r["category"],
+        })
+
+    df = pd.DataFrame(rows)
+    cat_order = {"資産 / Assets": 0, "負債 / Liabilities": 1, "資本 / Equity": 2}
+    df["_cat_order"] = df["_category"].map(cat_order)
+    df["_abs_cur"]   = df["_cur"].abs()
+    df = (df.sort_values(["_cat_order", "_abs_cur"], ascending=[True, False])
+            .drop(columns=["_cat_order", "_abs_cur"])
+            .reset_index(drop=True))
+    return df
 
 
 def _bs_imbalance_note(df: pd.DataFrame) -> str:
@@ -1834,12 +1980,97 @@ if st.session_state.get("filings"):
             "一部項目が欠損またはズレが生じる可能性があります。他社データは参考程度でご利用ください。"
         )
 
+        # ── PARR限定: 四半期別 売上高・純利益トレンド（過去3年） ──────────
+        if is_parr:
+            st.markdown("---")
+            st.markdown("## 📈 四半期別 売上高・純利益の推移（過去3年）")
+            with st.spinner("決算期リストから四半期トレンドを計算中…"):
+                trend_df = extract_quarterly_trend(facts, filings, years=3)
+            if trend_df is not None and not trend_df.empty and (
+                trend_df["revenue"].notna().any() or trend_df["net_income"].notna().any()
+            ):
+                import plotly.graph_objects as go
+                _tfig = go.Figure()
+                _tfig.add_trace(go.Scatter(
+                    x=trend_df["quarter_label"], y=trend_df["revenue"].round(1),
+                    name="売上高 (USD M)", mode="lines+markers",
+                    line=dict(color="#2563EB", width=2), marker=dict(size=6),
+                    yaxis="y1",
+                    hovertemplate="%{x}<br>売上高: $%{y:,.1f}M<extra></extra>",
+                ))
+                _tfig.add_trace(go.Scatter(
+                    x=trend_df["quarter_label"], y=trend_df["net_income"].round(1),
+                    name="純利益 (USD M)", mode="lines+markers",
+                    line=dict(color="#16A34A", width=2, dash="dot"), marker=dict(size=6),
+                    yaxis="y2",
+                    hovertemplate="%{x}<br>純利益: $%{y:,.1f}M<extra></extra>",
+                ))
+                _tfig.update_layout(
+                    height=360,
+                    margin=dict(l=0, r=0, t=10, b=0),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01,
+                                xanchor="right", x=1),
+                    hovermode="x unified",
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                    xaxis=dict(showgrid=False, zeroline=False, title="決算期"),
+                    yaxis=dict(
+                        title="売上高 (USD M)", title_font_color="#2563EB",
+                        tickfont=dict(color="#2563EB"), showgrid=True,
+                        gridcolor="#F3F4F6", zeroline=False,
+                    ),
+                    yaxis2=dict(
+                        title="純利益 (USD M)", title_font_color="#16A34A",
+                        tickfont=dict(color="#16A34A"), overlaying="y", side="right",
+                        showgrid=False, zeroline=True, zerolinecolor="#E5E7EB",
+                    ),
+                )
+                st.plotly_chart(_tfig, use_container_width=True)
+                st.caption(
+                    "※ 10-Qは累積(YTD)値、10-Kは通期値として開示されるため、各四半期単独の値は"
+                    "前の四半期までの累積値を差し引いて算出（de-cumulation）しています。"
+                    "決算期リストの取得範囲（最大24期）を超える過去データが必要な場合、"
+                    "最も古い四半期の値は正しく算出できないことがあります。"
+                )
+            else:
+                st.info("四半期トレンドデータを算出できませんでした。")
+
         st.markdown("## 🏦 貸借対照表（B/S） — 前四半期比（QoQ）")
         _bs_df = build_bs_df(bs)
         st.dataframe(_style_df(_bs_df), width="stretch", height=340)
         _bs_note = _bs_imbalance_note(_bs_df)
         if _bs_note:
             st.caption(_bs_note)
+
+        # ── PARR限定: B/S 全項目（前四半期比較） ─────────────────────
+        if is_parr:
+            st.markdown("---")
+            st.markdown("## 🏦 貸借対照表（B/S）— 全項目（PARR限定・前四半期比較）")
+            st.caption(
+                "※ SEC XBRLで報告されている全てのUSD建て時点(instant)項目が対象です。"
+                "主要科目に加え、注記(footnote)レベルの内訳項目が含まれる場合があります。"
+                "原本ファイリングでのバックチェックを推奨します。"
+            )
+            with st.spinner("全B/S項目を集計中…"):
+                bs_full_df = extract_bs_full(facts, period)
+            if bs_full_df is not None and not bs_full_df.empty:
+                n_a = int((bs_full_df["_category"] == "資産 / Assets").sum())
+                n_l = int((bs_full_df["_category"] == "負債 / Liabilities").sum())
+                n_e = int((bs_full_df["_category"] == "資本 / Equity").sum())
+                st.caption(f"検出項目数: {len(bs_full_df)} 件（資産 {n_a} ／ 負債 {n_l} ／ 資本 {n_e}）")
+                for cat_label, cat_key, expanded in (
+                    ("💰 資産の部 / Assets", "資産 / Assets", True),
+                    ("📑 負債の部 / Liabilities", "負債 / Liabilities", False),
+                    ("🏛️ 資本の部 / Equity", "資本 / Equity", False),
+                ):
+                    sub = bs_full_df[bs_full_df["_category"] == cat_key]
+                    if sub.empty:
+                        continue
+                    with st.expander(f"{cat_label}（{len(sub)}件）", expanded=expanded):
+                        st.dataframe(_style_df(sub), width="stretch",
+                                     height=min(420, 60 + 35 * len(sub)))
+            else:
+                st.info("全B/S項目データを算出できませんでした。")
 
         st.markdown("---")
         st.markdown("## 📝 Management's Discussion and Analysis (MD&A)")
