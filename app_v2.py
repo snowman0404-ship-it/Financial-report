@@ -1209,19 +1209,51 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
     """決算期リスト（最大24期）から、過去N年分の「四半期単独」の売上高・純利益を算出する
     （全企業対象）。
 
-    3ヶ月単独の期間ファクトが開示されていればそれをそのまま使い、累積(YTD)しか
-    無い企業についてのみ、前の四半期までの累積値を差し引く de-cumulation を行う
-    （例: Q2単独 = 6ヶ月累積 − Q1）。タグ候補はPARR用・一般企業用を統合したものを使い、
-    期ごとに対象期に最も近いレコードを持つタグを選ぶため、年度途中でタグを
-    切り替えた企業にも追従できる。
-    直近フィリングの期末日を基準に過去N年分に絞り込んで返す。
+    開示の仕方は企業によって3通りあり、いずれにも対応する:
+      A) 全四半期について3ヶ月単独の期間ファクトを付けている → そのまま使う
+      B) 累積(YTD)しか付けていない（PARR等）→ 前四半期までの累積を差し引く
+      C) Q1〜Q3は3ヶ月単独を付けるが、期末は10-Kしか無いため第4四半期単独の
+         ファクトが存在しない（XOM等の12月決算の大手に多い）
+         → 通期 −（Q1+Q2+Q3）で逆算する
+
+    差し引きに使う「前四半期までの累積」は、ループ内で持ち回るのではなく
+    毎回ファクトから直接引く。決算期リストに欠落があっても（提出書類の取得上限や
+    未提出期があっても）誤った期間差を四半期値として出さないため。
     """
     ordered = sorted(
         [f for f in filings if f.get("form") in ("10-Q", "10-K") and f.get("period")],
         key=lambda f: f["period"],
     )
+
+    _cache = {}
+
+    def _pv(candidates, quarter: int, tgt: datetime) -> tuple:
+        """(3ヶ月単独, YTD) をメモ化付きで取得する。"""
+        key = (id(candidates), quarter, tgt)
+        if key not in _cache:
+            _cache[key] = _trend_period_values(facts, candidates, quarter, tgt)
+        return _cache[key]
+
+    def _prior_ytd(candidates, eff_q: int, tgt: datetime):
+        """1つ前の四半期までのYTDをファクトから直接引く（eff_q>=2 のとき）。"""
+        if eff_q < 2:
+            return None
+        # 3ヶ月ぶん遡った日付を狙う。実際の期末日とは数日ずれるが、
+        # 期間長フィルタと許容日数の範囲内なので取り違えは起きない。
+        _, ytd = _pv(candidates, eff_q - 1, tgt - timedelta(days=91))
+        return ytd
+
+    def _sum_prior_quarters(candidates, eff_q: int, tgt: datetime):
+        """当年度のQ1〜Q(eff_q-1)の「四半期単独」値の合計。1つでも欠ければ None。"""
+        total = 0.0
+        for back in range(1, eff_q):
+            q_direct, _ = _pv(candidates, 1, tgt - timedelta(days=91 * back))
+            if q_direct is None:
+                return None
+            total += q_direct
+        return total
+
     rows = []
-    prev_rev = prev_ni = prev_op = None
     for f in ordered:
         period = f["period"]
         form   = f.get("form", "10-Q")
@@ -1230,30 +1262,30 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
         eff_q  = 4 if form == "10-K" else q_num
         target = datetime.strptime(period, "%Y-%m-%d")
 
-        direct_rev, ytd_rev = _trend_period_values(facts, _TREND_REVENUE_TAGS, eff_q, target)
-        direct_ni,  ytd_ni  = _trend_period_values(facts, _TREND_NETINCOME_TAGS, eff_q, target)
-        direct_op,  ytd_op  = _trend_period_values(facts, _TREND_OPINCOME_TAGS, eff_q, target)
-
-        def _resolve(direct, ytd, prev):
-            # 3ヶ月単独の開示があればそのまま採用。無ければYTDから差し引いて算出。
+        def _resolve(candidates):
+            direct, ytd = _pv(candidates, eff_q, target)
+            # ① 3ヶ月単独の開示があればそのまま採用
             if direct is not None:
                 return direct
-            if ytd is None:
-                return None
             if eff_q == 1:
                 return ytd            # Q1は累積＝四半期単独
-            if prev is None:
-                # 直前四半期のYTDが取れていない。ここで累積値をそのまま返すと
-                # 6ヶ月/9ヶ月の累計を「1四半期の実績」としてグラフに載せてしまう
-                # （TTM算出にも波及する）ので、欠測として扱う。
-                return None
-            return ytd - prev
+            if ytd is not None:
+                # ② YTD − 前四半期までのYTD
+                prev = _prior_ytd(candidates, eff_q, target)
+                if prev is not None:
+                    return ytd - prev
+                # ③ YTD −（当年度の四半期単独値の合計）
+                #    Q1〜Q3は3ヶ月単独だけ、期末は通期だけ、という開示への対応。
+                prior_sum = _sum_prior_quarters(candidates, eff_q, target)
+                if prior_sum is not None:
+                    return ytd - prior_sum
+            # 累積値をそのまま四半期値として出すと6ヶ月/9ヶ月/通期の数字が
+            # 1四半期の実績として載ってしまうので、欠測として扱う。
+            return None
 
-        q_rev = _resolve(direct_rev, ytd_rev, prev_rev)
-        q_ni  = _resolve(direct_ni,  ytd_ni,  prev_ni)
-        q_op  = _resolve(direct_op,  ytd_op,  prev_op)
-
-        prev_rev, prev_ni, prev_op = ytd_rev, ytd_ni, ytd_op
+        q_rev = _resolve(_TREND_REVENUE_TAGS)
+        q_ni  = _resolve(_TREND_NETINCOME_TAGS)
+        q_op  = _resolve(_TREND_OPINCOME_TAGS)
 
         rows.append({
             "period": period, "period_dt": target, "form": form, "quarter_num": eff_q,
@@ -1271,6 +1303,31 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
     cutoff = latest - timedelta(days=365 * years + 45)
     df = df[df["period_dt"] >= cutoff].sort_values("period_dt").reset_index(drop=True)
     return df
+
+
+def diagnose_quarterly_trend(facts: dict, filings: list) -> pd.DataFrame:
+    """トレンドが算出できなかったときに、どこで詰まったかを示す診断表を返す。"""
+    ordered = sorted(
+        [f for f in filings if f.get("form") in ("10-Q", "10-K") and f.get("period")],
+        key=lambda f: f["period"], reverse=True,
+    )[:8]
+    groups = (("売上高", _TREND_REVENUE_TAGS), ("純利益", _TREND_NETINCOME_TAGS))
+    out = []
+    for f in ordered:
+        period = f["period"]
+        target = datetime.strptime(period, "%Y-%m-%d")
+        eff_q  = 4 if f.get("form") == "10-K" else _quarter_num(period, f.get("fy_end", "1231"))
+        row = {"決算期": period, "form": f.get("form"), "Q": eff_q}
+        for label, cands in groups:
+            tag3, _, recs3 = _best_ytd_tag(facts, cands, 1, target)
+            tagy, _, recsy = _best_ytd_tag(facts, cands, eff_q, target)
+            d3 = _find_closest(_dedup_latest(recs3, 100), target, 45) if recs3 else None
+            dy = _find_closest(_dedup_latest(recsy, 100), target, 65) if recsy else None
+            row[f"{label}:採用タグ"] = tag3 or tagy or "—"
+            row[f"{label}:3ヶ月"]   = "○" if d3 else "×"
+            row[f"{label}:YTD"]     = "○" if dy else "×"
+        out.append(row)
+    return pd.DataFrame(out)
 
 
 def extract_bs(facts: dict, target_period: str | None = None) -> dict:
@@ -2620,6 +2677,24 @@ if st.session_state.get("filings"):
             )
         else:
             st.info("四半期トレンドデータを算出できませんでした。")
+            with st.expander("🔧 なぜ算出できなかったか（診断）", expanded=False):
+                st.markdown(
+                    f"- 対象となった提出書類: **{len(filings)}件**（10-Q / 10-K）\n"
+                    f"- XBRLファクトの取得: **{'成功' if facts else '失敗'}**"
+                )
+                try:
+                    _diag = diagnose_quarterly_trend(facts, filings)
+                    if _diag.empty:
+                        st.warning("決算期リストに10-Q/10-Kが1件もありません。")
+                    else:
+                        st.dataframe(_diag, width="stretch")
+                        st.caption(
+                            "「3ヶ月」「YTD」の列が両方 × の期は、その勘定科目の期間ファクトが"
+                            "XBRLに見つからなかった期です。採用タグが想定と違う場合は"
+                            "タグ候補リストへの追加が必要になります。"
+                        )
+                except Exception as _de:
+                    st.warning(f"診断の実行にも失敗しました: {_de}")
 
         # ── PARR限定: 市況（原油価格・クラックスプレッド）との重ね合わせ ──────
         if is_parr and trend_df is not None and not trend_df.empty:
