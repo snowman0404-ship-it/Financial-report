@@ -278,6 +278,35 @@ def _get_peer_prices(tickers: tuple, years: int = 3) -> pd.DataFrame:
     return (close / close.iloc[0] - 1.0) * 100.0
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def _yf_price_and_info(ticker: str) -> tuple:
+    """直近株価と info をまとめて取得する（キャッシュ対象）。
+
+    history() と info は同一の Ticker から呼ぶ（crumb/セッションを共有するため）。
+    ダウンロードボタン等でスクリプトが再実行されるたびに Yahoo を叩かないよう、
+    ネットワークアクセスを伴うこの部分だけを切り出してキャッシュしている。
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None, {}
+
+    t = yf.Ticker(ticker)
+    price = None
+    try:
+        h = t.history(period="5d")
+        if not h.empty:
+            price = float(h["Close"].iloc[-1])
+    except Exception:
+        pass
+    info = {}
+    try:
+        info = t.info or {}
+    except Exception:
+        pass
+    return price, info
+
+
 def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
     """Compute PER/PBR with 3-level fallback.
 
@@ -330,29 +359,9 @@ def _compute_valuation(ticker: str, facts: dict, bs: dict) -> dict:
                     break
         return sum(uniq) if len(uniq) == 4 else None
 
-    try:
-        import yfinance as yf
-    except ImportError:
+    price, info = _yf_price_and_info(ticker)
+    if price is None and not info:
         return {}
-
-    # Single Ticker object — shares crumb/session across history() and info
-    t = yf.Ticker(ticker)
-
-    # Price from history() — most reliable yfinance endpoint
-    price = None
-    try:
-        h = t.history(period="5d")
-        if not h.empty:
-            price = float(h["Close"].iloc[-1])
-    except Exception:
-        pass
-
-    # info for fundamental fields
-    info = {}
-    try:
-        info = t.info or {}
-    except Exception:
-        pass
 
     if not price:
         price = _fpos(info.get("currentPrice")) or _fpos(info.get("regularMarketPrice"))
@@ -867,6 +876,7 @@ def extract_mda(html: str, form_type: str = "10-Q", max_chars: int = 30_000) -> 
     return tail[:end_offset].strip()[:max_chars]
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_mda(cik: str, accession: str, primary_doc: str, form_type: str = "10-Q") -> str:
     cik_int    = int(cik)
     acc_nodash = accession.replace("-", "")
@@ -2279,7 +2289,8 @@ h2 { color: #2E75B6; font-size:1.1rem; margin-top:1.2rem; margin-bottom:0.3rem; 
 """, unsafe_allow_html=True)
 
 # Session state init
-for k in ("filings", "last_ticker", "cik", "company_name", "facts", "search_results"):
+for k in ("filings", "last_ticker", "cik", "company_name", "facts",
+          "search_results", "analysis_key"):
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -2363,6 +2374,7 @@ if fetch_btn:
                 st.session_state.cik          = cik
                 st.session_state.company_name = company_name
                 st.session_state.facts        = None
+                st.session_state.analysis_key = None   # 前回の分析結果を破棄
                 st.success(f"✅ {company_name} — {len(filings)} 件の決算期を取得しました。")
 
 st.markdown("---")
@@ -2381,7 +2393,17 @@ if st.session_state.get("filings"):
 
     selected = next(f for f in filings if f["label"] == selected_label)
 
+    # ボタンの押下状態そのものを表示条件にすると、ダウンロードボタン等で
+    # Streamlitがスクリプトを再実行した瞬間に run_btn が False に戻り、
+    # 分析結果が丸ごと消えてしまう（＝振り出しに戻る）。
+    # そこで「どの銘柄・決算期を実行したか」をセッションに記録し、現在の選択と
+    # 一致している間は結果を表示し続ける。決算期を変えれば自動的に非表示になる。
+    _analysis_key = (st.session_state.last_ticker, selected["period"],
+                     selected.get("form", "10-Q"))
     if run_btn:
+        st.session_state.analysis_key = _analysis_key
+
+    if st.session_state.get("analysis_key") == _analysis_key:
         ticker       = st.session_state.last_ticker
         cik          = st.session_state.cik
         company_name = st.session_state.company_name
