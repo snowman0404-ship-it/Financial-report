@@ -19,7 +19,6 @@ from pathlib import Path
 
 TEMPLATE_PATH = Path(__file__).with_name("templates") / "parr_report_template.pptx"
 
-# テンプレート注記「成績良化を青字、悪化を赤字で記載」に対応する色
 _PLAIN_RGB = (0x00, 0x00, 0x00)     # 前年度比の文字色（黒で統一）
 
 # P&L 表の行の並び（テンプレートの行順と対応）
@@ -139,14 +138,42 @@ def _m(val):
         return None
 
 
-def _pl_value(pl: dict, key: str, which: str):
-    t = pl.get(key, {}).get(which)
-    return _m(t[0]) if t and t[0] is not None else None
+def _canon_date(dataset: dict, which: str) -> str:
+    """データセット全体で最も多数派の基準日を「その期の正しい日付」とみなす。"""
+    from collections import Counter
+    dates = [v[1] for v in (d.get(which) for d in dataset.values())
+             if v is not None and v[1]]
+    return Counter(dates).most_common(1)[0][0] if dates else "—"
 
 
-def _bs_value(bs: dict, key: str, which: str):
-    t = bs.get(key, {}).get(which)
-    return _m(t[0]) if t and t[0] is not None else None
+def _period_ok(t, canon: str, tolerance_days: int = 50) -> bool:
+    """タプル t の基準日が canon から tolerance_days 以内かどうか。
+
+    タグによっては当期の値が取れず、数年前のファクトが紛れ込むことがある。
+    画面表示（app_v2.build_pl_df / build_bs_df）は同じ判定で弾いているので、
+    PPT側でも同じ基準を適用して数字が食い違わないようにする。
+    """
+    if t is None or not t[1] or canon == "—":
+        return False
+    try:
+        return abs((datetime.strptime(t[1], "%Y-%m-%d")
+                    - datetime.strptime(canon, "%Y-%m-%d")).days) <= tolerance_days
+    except ValueError:
+        return False
+
+
+def _value(dataset: dict, key: str, which: str, canon: dict | None = None):
+    """百万USDの値を返す。canon を渡した場合は期ズレの値を N/A 扱いにする。"""
+    t = dataset.get(key, {}).get(which)
+    if t is None or t[0] is None:
+        return None
+    if canon is not None and not _period_ok(t, canon.get(which, "—")):
+        return None
+    return _m(t[0])
+
+
+def _canon_map(dataset: dict) -> dict:
+    return {w: _canon_date(dataset, w) for w in ("current", "prior")}
 
 
 def _quarter_label(period: str, form: str, quarter_num: int) -> tuple:
@@ -171,7 +198,7 @@ def _add_native_chart(slide, anchor_shape, categories, series_name, values,
     後から編集できる。
     """
     from pptx.chart.data import CategoryChartData
-    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+    from pptx.enum.chart import XL_CHART_TYPE
     from pptx.util import Pt
 
     left, top = anchor_shape.left, anchor_shape.top
@@ -254,11 +281,14 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
         "A年BQ": f"{cur_y}{cur_q}",
         "(A-1)YBQ": f"{prior_y}{cur_q}",
         "Par Pacific": _short_name,     # 他社を分析した場合は社名を差し替える
+        # 差額は色分けせず黒字で印字するため、テンプレートの注記は落とす
+        "（成績良化を青字、悪化を赤字で記載）": "",
     }
     for sh in s1.shapes:
         _replace_in_shape(sh, title_map)
 
     # 列の並びは「左=前年度、右=最新」（時系列で左→右に読める向き）
+    _pl_canon = _canon_map(pl)
     t1 = next(sh.table for sh in s1.shapes if sh.has_table)
     _set_cell(t1, 0, 1, prior_y, para=0)
     _set_cell(t1, 0, 1, cur_q,   para=1)
@@ -266,8 +296,8 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
     _set_cell(t1, 0, 2, cur_q,   para=1)
 
     for i, (key, label) in enumerate(_PL_ROWS, start=1):
-        cur = _pl_value(pl, key, "current")
-        pri = _pl_value(pl, key, "prior")
+        cur = _value(pl, key, "current", _pl_canon)
+        pri = _value(pl, key, "prior", _pl_canon)
         diff = (cur - pri) if (cur is not None and pri is not None) else None
         _set_cell(t1, i, 0, label)
         _set_cell(t1, i, 1, _fmt(pri))      # 左: 前年度
@@ -306,26 +336,27 @@ def build_report(company_name: str, ticker: str, period: str, form: str,
     # 「合計」（オレンジ）はテンプレートの色を残す。
     # 表1(BS概要) の r0 は c0+c1 / c2+c3 が結合されているため両方を指定する。
     _keep = {0: {(0, 2), (0, 3)},           # BS概要: 「今期」ヘッダ
-             1: {(0, 2), (4, 0)}}           # 内訳:   「今期」ヘッダ・「合計」
+             1: {(0, 2), (4, 0), (4, 1), (4, 2)}}  # 内訳: 「今期」ヘッダ・「合計」行
     tables2 = [sh.table for sh in s2.shapes if sh.has_table]
     for _i, _t in enumerate(tables2):
         _clear_table_fill(_t, keep=_keep.get(_i, set()))
     t2 = tables2[0]
 
-    cash_c = _bs_value(bs, "Cash", "current")
-    cash_p = _bs_value(bs, "Cash", "prior")
-    ca_c   = _bs_value(bs, "CurrentAssets", "current")
-    ca_p   = _bs_value(bs, "CurrentAssets", "prior")
+    _bs_canon = _canon_map(bs)
+    cash_c = _value(bs, "Cash", "current", _bs_canon)
+    cash_p = _value(bs, "Cash", "prior", _bs_canon)
+    ca_c   = _value(bs, "CurrentAssets", "current", _bs_canon)
+    ca_p   = _value(bs, "CurrentAssets", "prior", _bs_canon)
     oca_c  = (ca_c - cash_c) if (ca_c is not None and cash_c is not None) else None
     oca_p  = (ca_p - cash_p) if (ca_p is not None and cash_p is not None) else None
-    nca_c  = _bs_value(bs, "NonCurrentAssets", "current")
-    nca_p  = _bs_value(bs, "NonCurrentAssets", "prior")
-    cl_c   = _bs_value(bs, "CurrentLiabilities", "current")
-    cl_p   = _bs_value(bs, "CurrentLiabilities", "prior")
-    ltl_c  = _bs_value(bs, "LongTermLiabilities", "current")
-    ltl_p  = _bs_value(bs, "LongTermLiabilities", "prior")
-    eq_c   = _bs_value(bs, "StockholdersEquity", "current")
-    eq_p   = _bs_value(bs, "StockholdersEquity", "prior")
+    nca_c  = _value(bs, "NonCurrentAssets", "current", _bs_canon)
+    nca_p  = _value(bs, "NonCurrentAssets", "prior", _bs_canon)
+    cl_c   = _value(bs, "CurrentLiabilities", "current", _bs_canon)
+    cl_p   = _value(bs, "CurrentLiabilities", "prior", _bs_canon)
+    ltl_c  = _value(bs, "LongTermLiabilities", "current", _bs_canon)
+    ltl_p  = _value(bs, "LongTermLiabilities", "prior", _bs_canon)
+    eq_c   = _value(bs, "StockholdersEquity", "current", _bs_canon)
+    eq_p   = _value(bs, "StockholdersEquity", "prior", _bs_canon)
 
     ta_c = sum(v for v in (cash_c, oca_c, nca_c) if v is not None) \
         if any(v is not None for v in (cash_c, oca_c, nca_c)) else None

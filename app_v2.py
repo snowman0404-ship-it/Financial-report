@@ -181,6 +181,9 @@ def _get_market_conditions(years: int = 3) -> pd.DataFrame:
     except ValueError:
         q = df.resample("Q").mean()           # 旧pandas
     q = q.dropna()
+    # 進行中の四半期は、まだ数日〜数週間ぶんの価格しか無いのに
+    # 「四半期平均」として他の完成した四半期と並んでしまうので落とす。
+    q = q[q.index <= pd.Timestamp(datetime.now().date())]
     if q.empty:
         return pd.DataFrame()
     out = q.reset_index(drop=True)
@@ -271,9 +274,18 @@ def _get_peer_prices(tickers: tuple, years: int = 3) -> pd.DataFrame:
     close = _to_naive_index(pd.DataFrame(close)).dropna(how="all")
     if close.empty:
         return pd.DataFrame()
-    # 全銘柄が揃っている最初の日を基準に指数化（比較の基準日を揃える）
-    close = close.dropna()
-    if close.empty:
+    # 期間開始日を基準に指数化するため、全銘柄で基準日を揃える必要がある。
+    # ただし行単位の dropna() だと、1銘柄でも欠測した週があるだけでその週が
+    # 全銘柄から落ち、さらに履歴の短い銘柄が1つ混ざると期間全体が
+    # その銘柄の上場日以降まで縮んでしまう。そこで
+    #   ① データが全く無い銘柄を落とす
+    #   ② 単発の欠測は直前値で補う（週次なので影響は小さい）
+    #   ③ それでも期間開始時点の値が無い銘柄だけを除外する
+    # の順で処理し、他社の3年間の窓は保つ。
+    close = close.dropna(axis=1, how="all")
+    close = close.ffill()
+    close = close.loc[:, close.iloc[0].notna()]
+    if close.empty or close.shape[1] == 0:
         return pd.DataFrame()
     return (close / close.iloc[0] - 1.0) * 100.0
 
@@ -626,6 +638,34 @@ SIMPLE_PL_TAGS = {
         "NetIncomeLossAttributableToParentCompany",
     ],
 }
+
+# 営業外の科目のうち、「費用を正の数」で報告するタグ。
+# （これ以外は符号付きの純額＝マイナスが費用、という前提で扱う）
+_EXPENSE_POSITIVE_TAGS = {
+    "OtherNonoperatingExpense",
+    "NonoperatingExpense",
+    "InterestAndDebtExpense",
+    "InterestExpense",
+}
+
+
+def _same_period(*tuples, tolerance_days: int = 50) -> bool:
+    """(値, 基準日, タグ) タプル群が同じ期のものかどうか。
+
+    会計恒等式で科目を導出するとき、片方だけ当期の値が取れず数年前のファクトが
+    混ざることがある。そのまま引き算すると桁違いの「導出値」ができ、しかも
+    代表日付は当期のものになるため _period_ok も通ってしまう。導出の前に
+    オペランドの期が揃っていることを確認する。
+    """
+    dates = []
+    for t in tuples:
+        if t is None or not t[1]:
+            return False
+        try:
+            dates.append(datetime.strptime(t[1], "%Y-%m-%d"))
+        except (ValueError, TypeError):
+            return False
+    return all(abs((d - dates[0]).days) <= tolerance_days for d in dates)
 
 SIMPLE_PL_LABELS = {
     "Revenues":            "売上高 / Revenues",
@@ -1086,7 +1126,8 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
             if t is None or t[0] is None:
                 r_t = rev.get(which)
                 o_t = opi.get(which)
-                if r_t and o_t and r_t[0] is not None and o_t[0] is not None:
+                if (r_t and o_t and r_t[0] is not None and o_t[0] is not None
+                        and _same_period(r_t, o_t)):
                     result.setdefault("OperatingExpenses", {})[which] = (
                         r_t[0] - o_t[0], r_t[1], "※導出値: Revenues − OperatingIncomeLoss"
                     )
@@ -1111,25 +1152,33 @@ def extract_pl(facts: dict, target_period: str | None = None, form_type: str = "
             ni  = _t("NetIncomeLoss", which)
 
             # 売上総利益 = 売上高 − 売上原価
-            if gp is None and rev and cor:
+            if gp is None and rev and cor and _same_period(rev, cor):
                 _set("GrossProfit", which, rev[0] - cor[0], rev,
                      "※導出値: Revenues − CostOfRevenue")
                 gp = _t("GrossProfit", which)
             # 売上原価 = 売上高 − 売上総利益
-            if cor is None and rev and gp:
+            if cor is None and rev and gp and _same_period(rev, gp):
                 _set("CostOfRevenue", which, rev[0] - gp[0], rev,
                      "※導出値: Revenues − GrossProfit")
             # 営業費用 = 売上高 − 営業利益
-            if _t("OperatingExpenses", which) is None and rev and opi:
+            if (_t("OperatingExpenses", which) is None and rev and opi
+                    and _same_period(rev, opi)):
                 _set("OperatingExpenses", which, rev[0] - opi[0], rev,
                      "※導出値: Revenues − OperatingIncomeLoss")
-            # 税引前利益 = 営業利益 + 営業外損益
-            if ibt is None and opi and nop:
-                _set("IncomeLossBeforeTax", which, opi[0] + nop[0], opi,
-                     "※導出値: OperatingIncome + NonOperating")
+            # 税引前利益 = 営業利益 ± 営業外損益
+            # 営業外の科目は「符号付きの純額（マイナス＝費用）」で報告するタグと
+            # 「費用の絶対額（プラス）」で報告するタグが混在する。後者をそのまま
+            # 足すと税引前利益を費用ぶん過大計上してしまうため、採用タグを見て
+            # 加算/減算を切り替える。
+            if ibt is None and opi and nop and _same_period(opi, nop):
+                _sign = -1 if nop[2] in _EXPENSE_POSITIVE_TAGS else 1
+                _note = ("※導出値: OperatingIncome − NonOperatingExpense"
+                         if _sign < 0 else "※導出値: OperatingIncome + NonOperating")
+                _set("IncomeLossBeforeTax", which, opi[0] + _sign * nop[0], opi, _note)
                 ibt = _t("IncomeLossBeforeTax", which)
             # 法人税等 = 税引前利益 − 純利益
-            if _t("IncomeTaxExpense", which) is None and ibt and ni:
+            if (_t("IncomeTaxExpense", which) is None and ibt and ni
+                    and _same_period(ibt, ni)):
                 _set("IncomeTaxExpense", which, ibt[0] - ni[0], ibt,
                      "※導出値: IncomeBeforeTax − NetIncome")
 
@@ -1191,8 +1240,13 @@ def extract_quarterly_trend(facts: dict, filings: list, years: int = 3) -> pd.Da
                 return direct
             if ytd is None:
                 return None
-            if eff_q == 1 or prev is None:
-                return ytd
+            if eff_q == 1:
+                return ytd            # Q1は累積＝四半期単独
+            if prev is None:
+                # 直前四半期のYTDが取れていない。ここで累積値をそのまま返すと
+                # 6ヶ月/9ヶ月の累計を「1四半期の実績」としてグラフに載せてしまう
+                # （TTM算出にも波及する）ので、欠測として扱う。
+                return None
             return ytd - prev
 
         q_rev = _resolve(direct_rev, ytd_rev, prev_rev)
@@ -2918,7 +2972,7 @@ if st.session_state.get("filings"):
             except Exception as _e:
                 st.error(f"PowerPointの生成に失敗しました: {_e}")
             st.caption(
-                "※ スライド1: P&L（前年同期比・差額を青字/赤字で色分け）＋売上高推移＋株価推移。"
+                "※ スライド1: P&L（前年同期比の差額付き）＋売上高推移＋株価推移。"
                 "スライド2: B/S（前四半期 vs 今期・差額付き）。"
                 "「主要な良化/悪化要因」欄と内訳表は、テンプレート同様に空欄のままなので"
                 "ダウンロード後にご記入ください。"
